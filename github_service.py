@@ -6,7 +6,7 @@ import base64
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional
+from typing import Dict
 
 import requests
 
@@ -57,8 +57,26 @@ class GitHubService:
             return None
         return response.json()
 
+    def check_repository_access(self) -> None:
+        try:
+            self._request('GET', '')
+        except GitHubServiceError as exc:
+            if '404' in str(exc):
+                raise GitHubServiceError(
+                    f'GitHub repository {self.config.repo_full_name} was not found or the configured token cannot access it. '
+                    'Check github.owner, github.mobile_repo, and token repository permissions.'
+                ) from exc
+            raise
+
     def get_branch_sha(self, branch: str) -> str:
-        data = self._request('GET', f'/git/ref/heads/{branch}')
+        try:
+            data = self._request('GET', f'/git/ref/heads/{branch}')
+        except GitHubServiceError as exc:
+            if '404' in str(exc):
+                raise GitHubServiceError(
+                    f'Base branch {branch} was not found in {self.config.repo_full_name}, or the token cannot read it.'
+                ) from exc
+            raise
         return data['object']['sha']
 
     def get_file_json(self, path: str, branch: str):
@@ -114,21 +132,29 @@ def build_commit_plan(service: GitHubService, branch: str, manual: Dict, files: 
     return planned
 
 
+def build_dry_run_plan(manual: Dict, files: Dict[str, bytes]) -> Dict[str, bytes]:
+    planned = dict(files)
+    index_payload = build_manual_index(None, manual)
+    planned[manual_index_destination()] = json.dumps(index_payload, indent=2, ensure_ascii=False).encode('utf-8')
+    return planned
+
+
 def submit_pull_request(config: GitHubConfig, manual: Dict, files: Dict[str, bytes]) -> Dict:
-    service = GitHubService(config)
-    base_sha = service.get_branch_sha(config.base_branch)
     branch = make_branch_name(manual.get('manualId', 'manual'))
 
     if config.dry_run:
-        planned = build_commit_plan(service, config.base_branch, manual, files)
+        planned = build_dry_run_plan(manual, files)
         return {
             'dry_run': True,
             'branch': branch,
-            'base_sha': base_sha,
+            'base_sha': None,
             'files': sorted(planned),
             'pull_request_url': None,
         }
 
+    service = GitHubService(config)
+    service.check_repository_access()
+    base_sha = service.get_branch_sha(config.base_branch)
     service.create_branch(branch, base_sha)
     planned = build_commit_plan(service, branch, manual, files)
     manual_id = manual.get('manualId') or 'manual'
