@@ -19,7 +19,12 @@ from content_builder import (
     make_manual,
     validate_manual,
     zip_bytes,
+    build_submission_files,
+    manual_content_destination,
+    manual_index_destination,
 )
+from github_service import GitHubConfig, GitHubServiceError, submit_pull_request
+from validation import human_size, total_upload_size, validate_submission
 from product_catalog import clean_id, clean_product_id, get_categories, get_category_names, get_product_defaults, get_products, product_count
 
 st.set_page_config(page_title='Akademika Manual Content Builder', layout='wide')
@@ -45,6 +50,97 @@ def sync_manual_identity(defaults):
     manual['productId'] = defaults['productId']
     manual['manualId'] = defaults['manualId']
 
+
+
+
+def parse_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+    return bool(value)
+
+
+def github_config():
+    github = st.secrets.get('github', {})
+    return GitHubConfig(
+        token=github.get('token', ''),
+        owner=github.get('owner', ''),
+        repo=github.get('mobile_repo', ''),
+        base_branch=github.get('base_branch', 'main'),
+        dry_run=parse_bool(github.get('dry_run', True)),
+    )
+
+
+def submission_summary(config, manual, files):
+    manual_id = manual.get('manualId') or 'manual'
+    image_count = len(st.session_state.image_files)
+    st.subheader('Submission Summary')
+    col1, col2 = st.columns(2)
+    col1.write(f'**Destination repository:** `{config.owner}/{config.repo}`')
+    col1.write(f'**Base branch:** `{config.base_branch}`')
+    col1.write(f'**Manual ID:** `{manual_id}`')
+    col1.write(f'**Product:** `{manual.get("productName") or "-"}`')
+    col2.write(f'**Experiment count:** `{len(manual.get("experiments", []))}`')
+    col2.write(f'**Image count:** `{image_count}`')
+    col2.write(f'**Total upload size:** `{human_size(total_upload_size(files))}`')
+    st.write('**JSON destination paths:**')
+    st.code('\n'.join([manual_content_destination(manual_id), manual_index_destination()]), language='text')
+
+
+def submit_panel():
+    st.header('Submit to Akademika App')
+    manual = st.session_state.manual
+    config = github_config()
+    files = build_submission_files(manual, st.session_state.image_files)
+    submission_summary(config, manual, files)
+
+    if config.dry_run:
+        st.info('Dry-run mode is enabled. No branch, commit, or pull request will be created.')
+    else:
+        st.warning('Real submission mode is enabled. A branch and pull request will be created; main will not be changed directly.')
+
+    confirmed = st.checkbox('I confirm this content is ready for Akademika review.')
+    errors, warnings = validate_submission(manual, st.session_state.image_files, confirmed)
+    if warnings:
+        with st.expander('Submission Warnings'):
+            for warning in warnings:
+                st.write(f'- {warning}')
+
+    if st.button('Submit Pull Request', disabled=bool(errors)):
+        if errors:
+            for error in errors:
+                st.error(error)
+            return
+        missing = []
+        if not config.token:
+            missing.append('github.token')
+        if not config.owner:
+            missing.append('github.owner')
+        if not config.repo:
+            missing.append('github.mobile_repo')
+        if not config.base_branch:
+            missing.append('github.base_branch')
+        if missing:
+            st.error(f'Missing Streamlit secrets: {", ".join(missing)}')
+            return
+        try:
+            result = submit_pull_request(config, manual, files)
+        except GitHubServiceError as exc:
+            st.error(str(exc))
+            return
+
+        st.write('**Files:**')
+        st.code('\n'.join(result['files']), language='text')
+        if result['dry_run']:
+            st.success('Dry run completed successfully.')
+            st.caption('No branch, commit, or pull request was created.')
+        else:
+            st.success('Pull request created.')
+            st.write(f'Branch: `{result["branch"]}`')
+            st.link_button('Open Pull Request', result['pull_request_url'])
+    elif errors:
+        with st.expander('Submission Requirements'):
+            for error in errors:
+                st.write(f'- {error}')
 
 def current_experiment():
     experiments = st.session_state.manual.get('experiments', [])
@@ -239,6 +335,7 @@ def main():
     if experiment is None:
         st.info('Use Add Experiment in the sidebar to begin.')
         export_panel()
+        submit_panel()
         return
 
     st.header('Experiment')
@@ -261,6 +358,7 @@ def main():
                 section_editor(experiment, subsection_key, TECHNICAL_DATA_LABELS[subsection_key], technical=True)
 
     export_panel()
+    submit_panel()
 
 
 if __name__ == '__main__':

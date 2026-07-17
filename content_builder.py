@@ -7,6 +7,7 @@ import io
 import json
 import re
 import zipfile
+from pathlib import PurePosixPath
 from typing import Dict, Iterable, List, Tuple
 
 SECTION_KEYS = [
@@ -93,6 +94,16 @@ def make_content_payload(manual: Dict) -> Dict:
     return {'manuals': {manual_id: copy.deepcopy(manual)}}
 
 
+def submitted_manual_payload(manual: Dict) -> Dict:
+    payload = make_content_payload(manual)
+    manual_id = manual.get('manualId', '')
+    manual_copy = payload['manuals'].get(manual_id, {})
+    for _, _, block in iter_blocks(manual_copy):
+        if block.get('type') == 'image' and block.get('imageFile'):
+            block['imageFile'] = submission_image_relative_path(manual_id, block['imageFile'])
+    return payload
+
+
 def block_id(section_key: str, block_type: str, order: int) -> str:
     prefix = 'note' if block_type == 'note' else 'table' if block_type == 'table' else section_key
     return f'{prefix}_{order:03d}'
@@ -119,6 +130,72 @@ def image_path(manual_id: str, experiment_id: str, section_key: str, filename: s
     if technical:
         return f'images/{manual_id}/{experiment_id}/technicalData/{section_key}/{safe_file}'
     return f'images/{manual_id}/{experiment_id}/{section_key}/{safe_file}'
+
+
+def submission_image_relative_path(manual_id: str, image_file: str) -> str:
+    prefix = f'images/{manual_id}/'
+    if image_file.startswith(prefix):
+        return f'images/{image_file[len(prefix):]}'
+    if image_file.startswith('images/'):
+        return image_file
+    return f'images/{image_file.lstrip(chr(47))}'
+
+
+def submission_image_destination(manual_id: str, image_file: str) -> str:
+    relative = submission_image_relative_path(manual_id, image_file)
+    return str(PurePosixPath('src/content/manuals') / manual_id / relative)
+
+
+def manual_content_destination(manual_id: str) -> str:
+    return str(PurePosixPath('src/content/manuals') / manual_id / 'manualContent.json')
+
+
+def manual_index_destination() -> str:
+    return 'src/content/manualIndex.json'
+
+
+def submitted_json_bytes(manual: Dict) -> bytes:
+    return json.dumps(submitted_manual_payload(manual), indent=2, ensure_ascii=False).encode('utf-8')
+
+
+def build_submission_files(manual: Dict, image_files: Dict[str, bytes]) -> Dict[str, bytes]:
+    manual_id = manual.get('manualId') or 'manual'
+    files = {manual_content_destination(manual_id): submitted_json_bytes(manual)}
+    for image_file, content in sorted(image_files.items()):
+        files[submission_image_destination(manual_id, image_file)] = content
+    return files
+
+
+def build_manual_index(existing_index, manual: Dict) -> Dict:
+    manual_id = manual.get('manualId', '')
+    entry = {
+        'manualId': manual_id,
+        'productId': manual.get('productId', ''),
+        'categoryId': manual.get('categoryId', ''),
+        'productName': manual.get('productName', ''),
+        'categoryName': manual.get('categoryName', ''),
+        'path': manual_content_destination(manual_id),
+        'experimentCount': len(manual.get('experiments', [])),
+    }
+
+    if isinstance(existing_index, dict):
+        index = copy.deepcopy(existing_index)
+        manuals = index.get('manuals', [])
+        if isinstance(manuals, dict):
+            manuals[manual_id] = entry
+        else:
+            manuals = [item for item in manuals if isinstance(item, dict) and item.get('manualId') != manual_id]
+            manuals.append(entry)
+            manuals.sort(key=lambda item: item.get('manualId', ''))
+        index['manuals'] = manuals
+        return index
+
+    manuals = []
+    if isinstance(existing_index, list):
+        manuals = [item for item in existing_index if isinstance(item, dict) and item.get('manualId') != manual_id]
+    manuals.append(entry)
+    manuals.sort(key=lambda item: item.get('manualId', ''))
+    return {'manuals': manuals}
 
 
 def iter_blocks(manual: Dict) -> Iterable[Tuple[str, str, Dict]]:
