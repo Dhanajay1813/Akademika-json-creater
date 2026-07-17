@@ -2,6 +2,8 @@ import json
 
 import streamlit as st
 
+from catalog_builder import build_catalog_files, build_catalog_index_entry, human_size as catalog_human_size, pdf_page_count
+from catalog_validation import validate_catalog_submission
 from content_builder import (
     SECTION_KEYS,
     SECTION_LABELS,
@@ -23,13 +25,14 @@ from content_builder import (
     manual_content_destination,
     manual_index_destination,
 )
-from github_service import GitHubConfig, GitHubServiceError, submit_pull_request
+from github_service import GitHubConfig, GitHubServiceError, submit_catalog_pull_request, submit_pull_request
 from validation import human_size, total_upload_size, validate_submission
 from product_catalog import clean_id, clean_product_id, get_categories, get_category_names, get_product_defaults, get_products, product_count
 
 st.set_page_config(page_title='Akademika Manual Content Builder', layout='wide')
 
-CUSTOM_PRODUCT = 'Add Custom Product'
+CONTENT_TYPE_MANUAL = 'Experiment Manual'
+CONTENT_TYPE_CATALOG = 'Product Catalog'
 
 
 def init_state():
@@ -219,29 +222,21 @@ def section_editor(experiment, section_key, label, technical=False):
 
 def sidebar():
     st.sidebar.header('Product')
-    category_options = get_category_names() + [CUSTOM_PRODUCT]
-    selected_category = st.sidebar.selectbox('Select Category', category_options)
+    selected_category = st.sidebar.selectbox('Select Category', get_category_names())
+    products = get_products(selected_category)
+    selected_product = st.sidebar.selectbox('Select Product', products)
+    defaults = get_product_defaults(selected_category, selected_product)
+    category_name = defaults['categoryName']
+    product_name = defaults['productName']
+    category_id = defaults['categoryId']
+    product_id = defaults['productId']
+    manual_id = defaults['manualId']
 
-    custom = selected_category == CUSTOM_PRODUCT
-    if custom:
-        category_name = st.sidebar.text_input('Category name', value=st.session_state.manual.get('categoryName', ''))
-        product_name = st.sidebar.text_input('Product name', value=st.session_state.manual.get('productName', ''))
-        default_category_id = clean_id(category_name)
-        default_product_id = clean_product_id(product_name) if product_name else ''
-    else:
-        products = get_products(selected_category)
-        selected_product = st.sidebar.selectbox('Select Product', products)
-        defaults = get_product_defaults(selected_category, selected_product)
-        category_name = defaults['categoryName']
-        product_name = defaults['productName']
-        default_category_id = defaults['categoryId']
-        default_product_id = defaults['productId']
-
-    st.sidebar.caption('IDs are auto-filled and can be manually overridden.')
-    identity_key = clean_id(f'{category_name}_{product_name}') or 'custom_product'
-    category_id = st.sidebar.text_input('categoryId', value=default_category_id, key=f'category_id_{identity_key}')
-    product_id = st.sidebar.text_input('productId', value=default_product_id, key=f'product_id_{identity_key}')
-    manual_id = st.sidebar.text_input('manualId', value=product_id, key=f'manual_id_{identity_key}')
+    st.sidebar.caption('IDs are official mobile-app IDs and cannot be edited here.')
+    st.sidebar.text_input('categoryId', value=category_id, disabled=True)
+    st.sidebar.text_input('productId', value=product_id, disabled=True)
+    st.sidebar.text_input('manualId', value=manual_id, disabled=True)
+    st.session_state.content_type = st.sidebar.radio('Content Type', [CONTENT_TYPE_MANUAL, CONTENT_TYPE_CATALOG])
 
     sync_manual_identity({
         'categoryName': category_name,
@@ -250,6 +245,9 @@ def sidebar():
         'productId': product_id,
         'manualId': manual_id,
     })
+
+    if st.session_state.content_type == CONTENT_TYPE_CATALOG:
+        return
 
     st.sidebar.divider()
     st.sidebar.header('Experiments')
@@ -278,6 +276,130 @@ def sidebar():
         except Exception as exc:
             st.sidebar.error(f'Could not load JSON: {exc}')
 
+
+
+
+def catalog_max_pdf_bytes():
+    catalog = st.secrets.get('catalog', {})
+    max_mb = catalog.get('max_pdf_mb', 80)
+    try:
+        return int(max_mb) * 1024 * 1024
+    except (TypeError, ValueError):
+        return 80 * 1024 * 1024
+
+
+def catalog_panel():
+    st.header('Product Catalog')
+    manual = st.session_state.manual
+    config = github_config()
+    max_pdf_bytes = catalog_max_pdf_bytes()
+
+    title = st.text_input('Catalog title', value=f"{manual.get('productName', 'Product')} Catalog")
+    cols = st.columns(2)
+    cols[0].text_input('Product name', value=manual.get('productName', ''), disabled=True)
+    cols[1].text_input('Product ID', value=manual.get('productId', ''), disabled=True)
+    cols = st.columns(2)
+    cols[0].text_input('Category name', value=manual.get('categoryName', ''), disabled=True)
+    cols[1].text_input('Category ID', value=manual.get('categoryId', ''), disabled=True)
+    version = st.text_input('Catalog version (optional)', value='')
+    revision_date = st.text_input('Revision date (optional)', value='')
+    description = st.text_area('Short description (optional)', value='', height=100)
+    pdf_file = st.file_uploader('Catalog PDF upload', type=['pdf'])
+    cover_file = st.file_uploader('Cover image upload (optional)', type=['png', 'jpg', 'jpeg', 'webp'])
+
+    if pdf_file is None:
+        st.info('Upload a catalog PDF to continue.')
+        return
+
+    pdf_bytes = pdf_file.getvalue()
+    if len(pdf_bytes) > max_pdf_bytes:
+        st.error(f'PDF exceeds the configured maximum size of {catalog_human_size(max_pdf_bytes)}.')
+        return
+
+    try:
+        page_count = pdf_page_count(pdf_bytes)
+    except Exception as exc:
+        st.error(f'Could not open PDF: {exc}')
+        return
+
+    metadata = {
+        'productId': manual.get('productId', ''),
+        'categoryId': manual.get('categoryId', ''),
+        'productName': manual.get('productName', ''),
+        'categoryName': manual.get('categoryName', ''),
+        'title': title.strip(),
+        'version': version.strip(),
+        'revisionDate': revision_date.strip(),
+        'description': description.strip(),
+    }
+
+    with st.spinner('Rendering PDF pages...'):
+        try:
+            generated = build_catalog_files(metadata, pdf_bytes, cover_file.getvalue() if cover_file else None)
+        except Exception as exc:
+            st.error(f'Could not render catalog PDF: {exc}')
+            return
+
+    errors = validate_catalog_submission(metadata, generated)
+    files = generated['files']
+    total_size = sum(len(value) for value in files.values())
+    is_update = False
+
+    st.subheader('Catalog Submission Summary')
+    col1, col2 = st.columns(2)
+    col1.write(f'**Destination repository:** `{config.owner}/{config.repo}`')
+    col1.write(f'**Category:** `{metadata["categoryName"]}`')
+    col1.write(f'**Product:** `{metadata["productName"]}`')
+    col1.write(f'**Product ID:** `{metadata["productId"]}`')
+    col1.write(f'**Catalog title:** `{metadata["title"]}`')
+    col2.write(f'**PDF filename:** `{pdf_file.name}`')
+    col2.write(f'**Original PDF size:** `{catalog_human_size(len(pdf_bytes))}`')
+    col2.write(f'**Page count:** `{page_count}`')
+    col2.write(f'**Generated image count:** `{len(generated["pages"])}`')
+    col2.write(f'**Total generated size:** `{catalog_human_size(total_size)}`')
+    col2.write(f'**Submission type:** `{"Update" if is_update else "New catalog or update check on submit"}`')
+
+    st.write('**Destination paths:**')
+    st.code('\n'.join(sorted(files)), language='text')
+    if generated['pages']:
+        st.image(generated['pages'][0]['bytes'], caption='Page 1 preview', use_container_width=True)
+    st.write('**catalogContent.json preview:**')
+    st.json(generated['content'])
+    st.write('**catalogIndex.json preview:**')
+    st.json(generated['index'])
+
+    if errors:
+        st.error('Fix these catalog validation errors before submitting:')
+        for error in errors:
+            st.write(f'- {error}')
+
+    if config.dry_run:
+        st.info('Dry-run mode is enabled. No branch, commit, or pull request will be created.')
+    else:
+        st.warning('Real mode is enabled. A catalog branch and pull request will be created; main will not be changed directly.')
+
+    confirmed = st.checkbox('I confirm this catalog is ready for Akademika review.')
+    if st.button('Submit Catalog Pull Request', disabled=bool(errors) or not confirmed):
+        if not config.token or not config.owner or not config.repo or not config.base_branch:
+            st.error('Missing GitHub Streamlit secrets.')
+            return
+        entry = build_catalog_index_entry(metadata, len(generated['pages']))
+        try:
+            result = submit_catalog_pull_request(config, metadata, files, entry)
+        except GitHubServiceError as exc:
+            st.error(str(exc))
+            return
+        st.write('**Files:**')
+        st.code('\n'.join(result['files']), language='text')
+        if result['dry_run']:
+            st.success('Catalog dry run completed successfully.')
+            st.caption('No branch, commit, or pull request was created.')
+        else:
+            st.success('Catalog pull request created.')
+            if result.get('is_update'):
+                st.info('This submission updates an existing catalog.')
+            st.write(f'Branch: `{result["branch"]}`')
+            st.link_button('Open Pull Request', result['pull_request_url'])
 
 def export_panel():
     st.header('Preview and Export')
@@ -322,9 +444,13 @@ def main():
     sidebar()
 
     st.title('Akademika Manual Content Builder')
-    st.caption(f'{len(get_categories())} categories and {product_count()} products are available. Custom products are also supported.')
+    st.caption(f'{len(get_categories())} categories and {product_count()} official mobile products are available.')
 
     manual = st.session_state.manual
+    if st.session_state.get('content_type') == CONTENT_TYPE_CATALOG:
+        catalog_panel()
+        return
+
     summary_cols = st.columns(4)
     summary_cols[0].metric('Category', manual.get('categoryName') or '-')
     summary_cols[1].metric('Product ID', manual.get('productId') or '-')

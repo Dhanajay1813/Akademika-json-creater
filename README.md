@@ -79,3 +79,26 @@ src/content/manuals/{manualId}/manualContent.json
 src/content/manuals/{manualId}/images/{experimentId}/{sectionPath}/{filename}
 src/content/manualIndex.json
 ```
+
+
+## Product Catalog Submission
+
+Select a category and product, then choose `Product Catalog` as the content type. Upload a PDF catalog and optional cover image. The app renders each PDF page with PyMuPDF, converts pages to readable WebP images, validates the generated catalog package, and submits a pull request to `Dhanajay1813/Akademika-Learning-App`.
+
+Generated catalog paths:
+
+```text
+src/content/catalogs/{productId}/catalogContent.json
+src/content/catalogs/{productId}/cover.webp
+src/content/catalogs/{productId}/pages/page_001.webp
+src/content/catalogIndex.json
+```
+
+When `dry_run = true`, Streamlit renders and validates the PDF, shows destination paths and JSON previews, and creates no branch, commit, or pull request.
+
+Configure the maximum catalog PDF size in Streamlit secrets:
+
+```toml
+[catalog]
+max_pdf_mb = 80
+```

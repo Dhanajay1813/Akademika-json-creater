@@ -11,6 +11,7 @@ from typing import Dict
 import requests
 
 from content_builder import build_manual_index, manual_index_destination
+from catalog_builder import build_catalog_index, catalog_index_path
 
 
 API_ROOT = 'https://api.github.com'
@@ -92,6 +93,18 @@ class GitHubService:
     def create_branch(self, branch: str, base_sha: str) -> None:
         self._request('POST', '/git/refs', json={'ref': f'refs/heads/{branch}', 'sha': base_sha})
 
+    def create_unique_branch(self, branch: str, base_sha: str) -> str:
+        for attempt in range(1, 11):
+            candidate = branch if attempt == 1 else f'{branch}-{attempt}'
+            try:
+                self.create_branch(candidate, base_sha)
+                return candidate
+            except GitHubServiceError as exc:
+                if '422' in str(exc) and 'Reference already exists' in str(exc):
+                    continue
+                raise
+        raise GitHubServiceError(f'Could not create a unique branch after 10 attempts from {branch}.')
+
     def put_file(self, path: str, content: bytes, branch: str, message: str) -> None:
         payload = {
             'message': message,
@@ -119,9 +132,17 @@ def timestamp_slug() -> str:
     return datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
 
 
+def safe_branch_part(value: str, fallback: str) -> str:
+    safe = ''.join(ch if ch.isalnum() or ch in '-_' else '-' for ch in value.strip().lower()).strip('-')
+    return safe or fallback
+
+
 def make_branch_name(manual_id: str) -> str:
-    safe = ''.join(ch if ch.isalnum() or ch in '-_' else '-' for ch in manual_id.strip().lower()).strip('-')
-    return f'content/{safe or "manual"}-{timestamp_slug()}'
+    return f'content/{safe_branch_part(manual_id, "manual")}-{timestamp_slug()}'
+
+
+def make_catalog_branch_name(product_id: str) -> str:
+    return f'catalog/{safe_branch_part(product_id, "product")}-{timestamp_slug()}'
 
 
 def build_commit_plan(service: GitHubService, branch: str, manual: Dict, files: Dict[str, bytes]) -> Dict[str, bytes]:
@@ -155,7 +176,7 @@ def submit_pull_request(config: GitHubConfig, manual: Dict, files: Dict[str, byt
     service = GitHubService(config)
     service.check_repository_access()
     base_sha = service.get_branch_sha(config.base_branch)
-    service.create_branch(branch, base_sha)
+    branch = service.create_unique_branch(branch, base_sha)
     planned = build_commit_plan(service, branch, manual, files)
     manual_id = manual.get('manualId') or 'manual'
     message = f'Add manual content for {manual_id}'
@@ -173,4 +194,54 @@ def submit_pull_request(config: GitHubConfig, manual: Dict, files: Dict[str, byt
         'base_sha': base_sha,
         'files': sorted(planned),
         'pull_request_url': pr.get('html_url'),
+    }
+
+
+
+def build_catalog_commit_plan(service: GitHubService, branch: str, catalog_entry: Dict, files: Dict[str, bytes]) -> Dict[str, bytes]:
+    planned = dict(files)
+    existing_index = service.get_file_json(catalog_index_path(), branch)
+    index_payload = build_catalog_index(existing_index, catalog_entry)
+    planned[catalog_index_path()] = json.dumps(index_payload, indent=2, ensure_ascii=False).encode('utf-8')
+    return planned
+
+
+def submit_catalog_pull_request(config: GitHubConfig, metadata: Dict, files: Dict[str, bytes], catalog_entry: Dict) -> Dict:
+    branch = make_catalog_branch_name(metadata.get('productId', 'product'))
+
+    if config.dry_run:
+        planned = dict(files)
+        return {
+            'dry_run': True,
+            'branch': branch,
+            'base_sha': None,
+            'files': sorted(planned),
+            'pull_request_url': None,
+            'is_update': False,
+        }
+
+    service = GitHubService(config)
+    service.check_repository_access()
+    base_sha = service.get_branch_sha(config.base_branch)
+    existing_index = service.get_file_json(catalog_index_path(), config.base_branch)
+    is_update = bool((existing_index or {}).get('catalogs', {}).get(catalog_entry['catalogId']))
+    branch = service.create_unique_branch(branch, base_sha)
+    planned = build_catalog_commit_plan(service, branch, catalog_entry, files)
+    product_name = metadata.get('productName') or metadata.get('productId') or 'product'
+    message = f'Add catalog for {product_name}'
+    for path, content in planned.items():
+        service.put_file(path, content, branch, message)
+
+    pr = service.create_pull_request(
+        branch,
+        title=f'Add catalog for {product_name}',
+        body='Generated product catalog submitted from the Akademika Streamlit editor.',
+    )
+    return {
+        'dry_run': False,
+        'branch': branch,
+        'base_sha': base_sha,
+        'files': sorted(planned),
+        'pull_request_url': pr.get('html_url'),
+        'is_update': is_update,
     }
