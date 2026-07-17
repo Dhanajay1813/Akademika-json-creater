@@ -154,13 +154,56 @@ def manual_index_destination() -> str:
     return 'src/content/manualIndex.json'
 
 
+def content_registry_destination() -> str:
+    return 'src/content/contentRegistry.js'
+
+
 def submitted_json_bytes(manual: Dict) -> bytes:
     return json.dumps(submitted_manual_payload(manual), indent=2, ensure_ascii=False).encode('utf-8')
 
 
+
+def js_identifier(value: str) -> str:
+    cleaned = re.sub(r'[^A-Za-z0-9_$]+', '_', value or 'manual')
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f'manual_{cleaned}'
+    return cleaned
+
+
+def build_content_registry(manual: Dict, image_files: Dict[str, bytes]) -> bytes:
+    manual_id = manual.get('manualId') or 'manual'
+    manual_var = f'{js_identifier(manual_id)}ManualContent'
+    lines = [
+        "import manualIndex from './manualIndex.json';",
+        f"import {manual_var} from './manuals/{manual_id}/manualContent.json';",
+        '',
+        'export const submittedManualIndex = manualIndex;',
+        '',
+        'export const submittedManuals = {',
+        f"  '{manual_id}': {manual_var}.manuals['{manual_id}'],",
+        '};',
+        '',
+        'export const submittedManualAssets = {',
+    ]
+    for image_file in sorted(image_files):
+        relative = submission_image_relative_path(manual_id, image_file)
+        lines.append(f"  '{manual_id}/{relative}': require('./manuals/{manual_id}/{relative}'),")
+    lines.extend([
+        '};',
+        '',
+        'export const getSubmittedManualImageSource = (manualId, imageFile) => (',
+        '  submittedManualAssets[`${manualId}/${imageFile}`] || null',
+        ');',
+        '',
+    ])
+    return '\n'.join(lines).encode('utf-8')
+
 def build_submission_files(manual: Dict, image_files: Dict[str, bytes]) -> Dict[str, bytes]:
     manual_id = manual.get('manualId') or 'manual'
-    files = {manual_content_destination(manual_id): submitted_json_bytes(manual)}
+    files = {
+        manual_content_destination(manual_id): submitted_json_bytes(manual),
+        content_registry_destination(): build_content_registry(manual, image_files),
+    }
     for image_file, content in sorted(image_files.items()):
         files[submission_image_destination(manual_id, image_file)] = content
     return files
