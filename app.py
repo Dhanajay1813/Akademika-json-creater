@@ -224,7 +224,9 @@ def add_block_ui(experiment, section_key, blocks, technical=False):
                 table_key = f'table_{experiment["id"]}_{section_key}_{technical}_{index}'
                 upload_key = f'upload_table_{experiment["id"]}_{section_key}_{technical}_{index}'
                 upload_state_key = f'{upload_key}_loaded'
-                uploaded_table = st.file_uploader('Upload CSV or Excel table', type=['csv', 'xlsx', 'xlsm'], key=upload_key)
+                if table_key not in st.session_state:
+                    st.session_state[table_key] = block.get('tableData', '')
+                uploaded_table = st.file_uploader('Upload CSV or Excel table', type=['csv', 'xlsx', 'xlsm', 'xls'], key=upload_key)
                 if uploaded_table is not None:
                     try:
                         uploaded_dataframe = read_table_file(uploaded_table)
@@ -235,12 +237,16 @@ def add_block_ui(experiment, section_key, blocks, technical=False):
                         if uploaded_dataframe.empty and len(uploaded_dataframe.columns) == 0:
                             st.error('Table file is empty.')
                         elif st.session_state.get(upload_state_key) != signature:
-                            block['tableData'] = dataframe_to_table_text(uploaded_dataframe)
-                            st.session_state[table_key] = block['tableData']
+                            imported_table = dataframe_to_table_text(uploaded_dataframe)
+                            block['tableData'] = imported_table
+                            st.session_state[table_key] = imported_table
                             st.session_state[upload_state_key] = signature
                             st.success(f'Imported {len(uploaded_dataframe)} rows into the table block.')
+                            st.rerun()
+                        else:
+                            block['tableData'] = st.session_state.get(table_key, block.get('tableData', ''))
                         st.dataframe(uploaded_dataframe, use_container_width=True, hide_index=True)
-                block['tableData'] = st.text_area('Table data', value=block.get('tableData', ''), key=table_key, height=160)
+                block['tableData'] = st.text_area('Table data', key=table_key, height=160)
             elif block['type'] == 'image':
                 uploaded = st.file_uploader('Upload image', type=['png', 'jpg', 'jpeg', 'webp'], key=f'image_{experiment["id"]}_{section_key}_{technical}_{index}')
                 if uploaded is not None:
