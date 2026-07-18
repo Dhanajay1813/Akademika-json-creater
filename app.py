@@ -1,4 +1,7 @@
 import json
+import io
+
+import pandas as pd
 
 import streamlit as st
 
@@ -54,6 +57,29 @@ def sync_manual_identity(defaults):
     manual['manualId'] = defaults['manualId']
 
 
+
+
+def csv_signature(uploaded_file):
+    if uploaded_file is None:
+        return ""
+    return f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
+
+
+def read_csv_table(uploaded_file):
+    return pd.read_csv(io.BytesIO(uploaded_file.getvalue()), dtype=str, keep_default_na=False)
+
+
+def clean_table_cell(value):
+    return str(value or "").replace("\n", " ").replace("|", "\\|").strip()
+
+
+def dataframe_to_table_text(dataframe):
+    columns = [clean_table_cell(column) or f"Column {index + 1}" for index, column in enumerate(dataframe.columns)]
+    rows = dataframe.fillna("").values.tolist()
+    header = "| " + " | ".join(columns) + " |"
+    separator = "| " + " | ".join(["---"] * len(columns)) + " |"
+    body = ["| " + " | ".join(clean_table_cell(cell) for cell in row) + " |" for row in rows]
+    return "\n".join([header, separator, *body])
 
 
 def parse_bool(value):
@@ -191,7 +217,26 @@ def add_block_ui(experiment, section_key, blocks, technical=False):
                 label = 'Note text' if block['type'] == 'note' else 'Text'
                 block['text'] = st.text_area(label, value=block.get('text', ''), key=f'text_{experiment["id"]}_{section_key}_{technical}_{index}', height=160)
             elif block['type'] == 'table':
-                block['tableData'] = st.text_area('Table data (CSV or simple table text)', value=block.get('tableData', ''), key=f'table_{experiment["id"]}_{section_key}_{technical}_{index}', height=160)
+                table_key = f'table_{experiment["id"]}_{section_key}_{technical}_{index}'
+                csv_key = f'csv_table_{experiment["id"]}_{section_key}_{technical}_{index}'
+                csv_state_key = f'{csv_key}_loaded'
+                uploaded_csv = st.file_uploader('Upload CSV table', type=['csv'], key=csv_key)
+                if uploaded_csv is not None:
+                    try:
+                        csv_table = read_csv_table(uploaded_csv)
+                    except Exception as exc:
+                        st.error(f'Could not read CSV: {exc}')
+                    else:
+                        signature = csv_signature(uploaded_csv)
+                        if csv_table.empty and len(csv_table.columns) == 0:
+                            st.error('CSV file is empty.')
+                        elif st.session_state.get(csv_state_key) != signature:
+                            block['tableData'] = dataframe_to_table_text(csv_table)
+                            st.session_state[table_key] = block['tableData']
+                            st.session_state[csv_state_key] = signature
+                            st.success(f'Imported {len(csv_table)} CSV rows into the table block.')
+                        st.dataframe(csv_table, use_container_width=True, hide_index=True)
+                block['tableData'] = st.text_area('Table data', value=block.get('tableData', ''), key=table_key, height=160)
             elif block['type'] == 'image':
                 uploaded = st.file_uploader('Upload image', type=['png', 'jpg', 'jpeg', 'webp'], key=f'image_{experiment["id"]}_{section_key}_{technical}_{index}')
                 if uploaded is not None:
