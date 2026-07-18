@@ -25,7 +25,6 @@ from content_builder import (
     validate_manual,
     zip_bytes,
     build_submission_files,
-    block_image_files,
     manual_content_destination,
     manual_index_destination,
 )
@@ -76,6 +75,21 @@ def indexed_image_filename(filename, index, total):
     if total <= 1:
         return filename
     return f"{index + 1:02d}_{filename}"
+
+
+def block_image_files(block):
+    image_files = block.get('imageFiles')
+    if isinstance(image_files, list):
+        normalized = []
+        for item in image_files:
+            if isinstance(item, str) and item:
+                normalized.append(item)
+            elif isinstance(item, dict) and item.get('imageFile'):
+                normalized.append(item['imageFile'])
+        if normalized:
+            return normalized
+    image_file = block.get('imageFile')
+    return [image_file] if image_file else []
 
 
 def set_block_image_files(block, image_files):
