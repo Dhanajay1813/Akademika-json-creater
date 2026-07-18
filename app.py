@@ -59,14 +59,18 @@ def sync_manual_identity(defaults):
 
 
 
-def csv_signature(uploaded_file):
+def table_file_signature(uploaded_file):
     if uploaded_file is None:
         return ""
     return f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
 
 
-def read_csv_table(uploaded_file):
-    return pd.read_csv(io.BytesIO(uploaded_file.getvalue()), dtype=str, keep_default_na=False)
+def read_table_file(uploaded_file):
+    data = io.BytesIO(uploaded_file.getvalue())
+    extension = uploaded_file.name.rsplit('.', 1)[-1].lower() if '.' in uploaded_file.name else ''
+    if extension == 'csv':
+        return pd.read_csv(data, dtype=str, keep_default_na=False)
+    return pd.read_excel(data, dtype=str, keep_default_na=False)
 
 
 def clean_table_cell(value):
@@ -218,24 +222,24 @@ def add_block_ui(experiment, section_key, blocks, technical=False):
                 block['text'] = st.text_area(label, value=block.get('text', ''), key=f'text_{experiment["id"]}_{section_key}_{technical}_{index}', height=160)
             elif block['type'] == 'table':
                 table_key = f'table_{experiment["id"]}_{section_key}_{technical}_{index}'
-                csv_key = f'csv_table_{experiment["id"]}_{section_key}_{technical}_{index}'
-                csv_state_key = f'{csv_key}_loaded'
-                uploaded_csv = st.file_uploader('Upload CSV table', type=['csv'], key=csv_key)
-                if uploaded_csv is not None:
+                upload_key = f'upload_table_{experiment["id"]}_{section_key}_{technical}_{index}'
+                upload_state_key = f'{upload_key}_loaded'
+                uploaded_table = st.file_uploader('Upload CSV or Excel table', type=['csv', 'xlsx', 'xlsm'], key=upload_key)
+                if uploaded_table is not None:
                     try:
-                        csv_table = read_csv_table(uploaded_csv)
+                        uploaded_dataframe = read_table_file(uploaded_table)
                     except Exception as exc:
-                        st.error(f'Could not read CSV: {exc}')
+                        st.error(f'Could not read table file: {exc}')
                     else:
-                        signature = csv_signature(uploaded_csv)
-                        if csv_table.empty and len(csv_table.columns) == 0:
-                            st.error('CSV file is empty.')
-                        elif st.session_state.get(csv_state_key) != signature:
-                            block['tableData'] = dataframe_to_table_text(csv_table)
+                        signature = table_file_signature(uploaded_table)
+                        if uploaded_dataframe.empty and len(uploaded_dataframe.columns) == 0:
+                            st.error('Table file is empty.')
+                        elif st.session_state.get(upload_state_key) != signature:
+                            block['tableData'] = dataframe_to_table_text(uploaded_dataframe)
                             st.session_state[table_key] = block['tableData']
-                            st.session_state[csv_state_key] = signature
-                            st.success(f'Imported {len(csv_table)} CSV rows into the table block.')
-                        st.dataframe(csv_table, use_container_width=True, hide_index=True)
+                            st.session_state[upload_state_key] = signature
+                            st.success(f'Imported {len(uploaded_dataframe)} rows into the table block.')
+                        st.dataframe(uploaded_dataframe, use_container_width=True, hide_index=True)
                 block['tableData'] = st.text_area('Table data', value=block.get('tableData', ''), key=table_key, height=160)
             elif block['type'] == 'image':
                 uploaded = st.file_uploader('Upload image', type=['png', 'jpg', 'jpeg', 'webp'], key=f'image_{experiment["id"]}_{section_key}_{technical}_{index}')
