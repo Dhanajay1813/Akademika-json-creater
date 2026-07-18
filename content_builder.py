@@ -99,8 +99,12 @@ def submitted_manual_payload(manual: Dict) -> Dict:
     manual_id = manual.get('manualId', '')
     manual_copy = payload['manuals'].get(manual_id, {})
     for _, _, block in iter_blocks(manual_copy):
-        if block.get('type') == 'image' and block.get('imageFile'):
-            block['imageFile'] = submission_image_relative_path(manual_id, block['imageFile'])
+        if block.get('type') == 'image':
+            image_files = block_image_files(block)
+            if image_files:
+                remapped_files = [submission_image_relative_path(manual_id, image_file) for image_file in image_files]
+                block['imageFiles'] = remapped_files
+                block['imageFile'] = remapped_files[0]
     return payload
 
 
@@ -119,6 +123,7 @@ def make_block(block_type: str, section_key: str, order: int, **kwargs) -> Dict:
         base['tableData'] = kwargs.get('tableData', '')
     elif block_type == 'image':
         base['imageFile'] = kwargs.get('imageFile', '')
+        base['imageFiles'] = kwargs.get('imageFiles', [])
         base['caption'] = kwargs.get('caption', '')
     else:
         raise ValueError(f'Unsupported block type: {block_type}')
@@ -144,6 +149,21 @@ def submission_image_relative_path(manual_id: str, image_file: str) -> str:
 def submission_image_destination(manual_id: str, image_file: str) -> str:
     relative = submission_image_relative_path(manual_id, image_file)
     return str(PurePosixPath('src/content/manuals') / manual_id / relative)
+
+
+def block_image_files(block: Dict) -> List[str]:
+    image_files = block.get('imageFiles')
+    if isinstance(image_files, list):
+        normalized = []
+        for item in image_files:
+            if isinstance(item, str) and item:
+                normalized.append(item)
+            elif isinstance(item, dict) and item.get('imageFile'):
+                normalized.append(item['imageFile'])
+        if normalized:
+            return normalized
+    image_file = block.get('imageFile')
+    return [image_file] if image_file else []
 
 
 def manual_content_destination(manual_id: str) -> str:
@@ -284,11 +304,12 @@ def validate_manual(manual: Dict, image_files: Dict[str, bytes]) -> Tuple[List[s
 
     for _, _, block in iter_blocks(manual):
         if block.get('type') == 'image':
-            image_file = block.get('imageFile')
-            if not image_file:
+            block_files = block_image_files(block)
+            if not block_files:
                 errors.append(f"Image block {block.get('id')} has no imageFile path.")
-            elif image_file not in image_files:
-                errors.append(f"Image referenced in JSON is missing from ZIP: {image_file}")
+            for image_file in block_files:
+                if image_file not in image_files:
+                    errors.append(f"Image referenced in JSON is missing from ZIP: {image_file}")
 
     for image_file in image_files:
         if not image_file.startswith('images/'):

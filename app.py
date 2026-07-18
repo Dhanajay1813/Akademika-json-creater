@@ -25,6 +25,7 @@ from content_builder import (
     validate_manual,
     zip_bytes,
     build_submission_files,
+    block_image_files,
     manual_content_destination,
     manual_index_destination,
 )
@@ -63,6 +64,23 @@ def table_file_signature(uploaded_file):
     if uploaded_file is None:
         return ""
     return f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
+
+
+def image_files_signature(uploaded_files):
+    if not uploaded_files:
+        return ""
+    return "|".join(f"{uploaded.name}:{getattr(uploaded, 'size', 0)}" for uploaded in uploaded_files)
+
+
+def indexed_image_filename(filename, index, total):
+    if total <= 1:
+        return filename
+    return f"{index + 1:02d}_{filename}"
+
+
+def set_block_image_files(block, image_files):
+    block['imageFiles'] = image_files
+    block['imageFile'] = image_files[0] if image_files else ''
 
 
 def read_table_file(uploaded_file):
@@ -248,22 +266,46 @@ def add_block_ui(experiment, section_key, blocks, technical=False):
                         st.dataframe(uploaded_dataframe, use_container_width=True, hide_index=True)
                 block['tableData'] = st.text_area('Table data', key=table_key, height=160)
             elif block['type'] == 'image':
-                uploaded = st.file_uploader('Upload image', type=['png', 'jpg', 'jpeg', 'webp'], key=f'image_{experiment["id"]}_{section_key}_{technical}_{index}')
-                if uploaded is not None:
-                    if extension_allowed(uploaded.name):
-                        relative_path = image_path(manual_id, experiment['id'], section_key, uploaded.name, technical=technical)
-                        st.session_state.image_files[relative_path] = uploaded.getvalue()
-                        block['imageFile'] = relative_path
-                    else:
+                upload_key = f'image_{experiment["id"]}_{section_key}_{technical}_{index}'
+                upload_state_key = f'{upload_key}_loaded'
+                uploaded_files = st.file_uploader(
+                    'Upload images',
+                    type=['png', 'jpg', 'jpeg', 'webp'],
+                    accept_multiple_files=True,
+                    key=upload_key,
+                )
+                if uploaded_files:
+                    invalid_files = [uploaded.name for uploaded in uploaded_files if not extension_allowed(uploaded.name)]
+                    if invalid_files:
                         st.error('Only png, jpg, jpeg, and webp images are allowed.')
-                block['caption'] = st.text_input('Optional caption', value=block.get('caption', ''), key=f'caption_{experiment["id"]}_{section_key}_{technical}_{index}')
-                if block.get('imageFile'):
-                    image_bytes = st.session_state.image_files.get(block['imageFile'])
-                    st.caption(block['imageFile'])
-                    if image_bytes:
-                        st.image(image_bytes, caption=block.get('caption') or None, use_container_width=True)
                     else:
-                        st.warning('This image path is in JSON, but the image bytes are not loaded in the current Streamlit session.')
+                        signature = image_files_signature(uploaded_files)
+                        if st.session_state.get(upload_state_key) != signature:
+                            for old_image_file in block_image_files(block):
+                                st.session_state.image_files.pop(old_image_file, None)
+                            image_files = []
+                            total_files = len(uploaded_files)
+                            for upload_index, uploaded in enumerate(uploaded_files):
+                                filename = indexed_image_filename(uploaded.name, upload_index, total_files)
+                                relative_path = image_path(manual_id, experiment['id'], section_key, filename, technical=technical)
+                                st.session_state.image_files[relative_path] = uploaded.getvalue()
+                                image_files.append(relative_path)
+                            set_block_image_files(block, image_files)
+                            st.session_state[upload_state_key] = signature
+                            st.success(f'Added {len(image_files)} image(s) to this image block.')
+                            st.rerun()
+
+                block['caption'] = st.text_input('Optional caption for all images', value=block.get('caption', ''), key=f'caption_{experiment["id"]}_{section_key}_{technical}_{index}')
+                image_files = block_image_files(block)
+                if image_files:
+                    st.caption(f'{len(image_files)} image(s) in this block')
+                    for image_file in image_files:
+                        image_bytes = st.session_state.image_files.get(image_file)
+                        st.caption(image_file)
+                        if image_bytes:
+                            st.image(image_bytes, caption=block.get('caption') or None, use_container_width=True)
+                        else:
+                            st.warning('This image path is in JSON, but the image bytes are not loaded in the current Streamlit session.')
 
 
 def section_editor(experiment, section_key, label, technical=False):
