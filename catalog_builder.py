@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import io
 import json
 import re
 from pathlib import PurePosixPath
 from typing import Dict, List, Optional
 
 import fitz
-from PIL import Image
-
-MAX_RENDER_WIDTH = 1600
-WEBP_QUALITY = 82
+from image_optimizer import image_metadata, optimize_image_bytes, render_pdf_pages, report_json_bytes, summarize_records
 
 
 def safe_text(value: str) -> str:
@@ -68,42 +64,38 @@ def pdf_page_count(pdf_bytes: bytes) -> int:
         return document.page_count
 
 
-def render_pdf_pages(pdf_bytes: bytes, max_width: int = MAX_RENDER_WIDTH, quality: int = WEBP_QUALITY) -> List[Dict]:
+def render_catalog_pdf_pages(pdf_bytes: bytes) -> List[Dict]:
     pages = []
-    with open_pdf(pdf_bytes) as document:
-        for index, page in enumerate(document, start=1):
-            rect = page.rect
-            zoom = min(max_width / rect.width, 3.0) if rect.width else 1.0
-            matrix = fitz.Matrix(zoom, zoom)
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            image = Image.open(io.BytesIO(pixmap.tobytes('png'))).convert('RGB')
-            buffer = io.BytesIO()
-            image.save(buffer, format='WEBP', quality=quality, method=6)
-            pages.append({
-                'pageNumber': index,
-                'filename': f'pages/page_{index:03d}.webp',
-                'bytes': buffer.getvalue(),
-                'width': image.width,
-                'height': image.height,
-            })
+    for page in render_pdf_pages(pdf_bytes):
+        pages.append({
+            'pageNumber': page['pageNumber'],
+            'filename': f"pages/{page['filename']}",
+            'bytes': page['bytes'],
+            'width': page['width'],
+            'height': page['height'],
+            'byteSize': page['byteSize'],
+            'sha256': page['sha256'],
+            'originalSize': page['originalSize'],
+            'optimizedSize': page['optimizedSize'],
+            'percentSaved': page['percentSaved'],
+            'profile': page['profile'],
+            'warning': page.get('warning', ''),
+            'textDense': page.get('textDense', False),
+            'converted': page.get('converted', True),
+        })
     return pages
 
 
-def convert_cover_image(cover_bytes: Optional[bytes]) -> Optional[bytes]:
+def convert_cover_image(cover_bytes: Optional[bytes]) -> Optional[Dict]:
     if not cover_bytes:
         return None
-    image = Image.open(io.BytesIO(cover_bytes)).convert('RGB')
-    if image.width > MAX_RENDER_WIDTH:
-        ratio = MAX_RENDER_WIDTH / image.width
-        image = image.resize((MAX_RENDER_WIDTH, int(image.height * ratio)))
-    buffer = io.BytesIO()
-    image.save(buffer, format='WEBP', quality=WEBP_QUALITY, method=6)
-    return buffer.getvalue()
+    optimized = optimize_image_bytes(cover_bytes, 'cover.png', 'catalog_cover')
+    optimized['filename'] = 'cover.webp'
+    return optimized
 
-
-def build_catalog_content(metadata: Dict, pages: List[Dict], has_cover: bool) -> Dict:
+def build_catalog_content(metadata: Dict, pages: List[Dict], cover: Optional[Dict]) -> Dict:
     product_id = metadata['productId']
-    return {
+    content = {
         'schemaVersion': 1,
         'catalogId': product_id,
         'productId': product_id,
@@ -114,13 +106,21 @@ def build_catalog_content(metadata: Dict, pages: List[Dict], has_cover: bool) ->
         'version': metadata.get('version', ''),
         'revisionDate': metadata.get('revisionDate', ''),
         'description': metadata.get('description', ''),
-        'coverImage': 'cover.webp' if has_cover else '',
+        'coverImage': 'cover.webp' if cover else '',
         'pageCount': len(pages),
         'pages': [
-            {'pageNumber': page['pageNumber'], 'imageFile': page['filename']}
+            image_metadata(page['filename'], page) | {'pageNumber': page['pageNumber']}
             for page in pages
         ],
     }
+    if cover:
+        content.update({
+            'coverWidth': cover['width'],
+            'coverHeight': cover['height'],
+            'coverByteSize': cover['byteSize'],
+            'coverSha256': cover['sha256'],
+        })
+    return content
 
 
 def build_catalog_index_entry(metadata: Dict, page_count: int) -> Dict:
@@ -145,9 +145,9 @@ def build_catalog_index(existing_index, entry: Dict) -> Dict:
 
 
 def build_catalog_files(metadata: Dict, pdf_bytes: bytes, cover_bytes: Optional[bytes] = None, existing_index=None) -> Dict:
-    pages = render_pdf_pages(pdf_bytes)
+    pages = render_catalog_pdf_pages(pdf_bytes)
     cover = convert_cover_image(cover_bytes)
-    content = build_catalog_content(metadata, pages, bool(cover))
+    content = build_catalog_content(metadata, pages, cover)
     entry = build_catalog_index_entry(metadata, len(pages))
     index = build_catalog_index(existing_index, entry)
     product_id = metadata['productId']
@@ -155,8 +155,31 @@ def build_catalog_files(metadata: Dict, pdf_bytes: bytes, cover_bytes: Optional[
         catalog_content_path(product_id): json.dumps(content, indent=2, ensure_ascii=False).encode('utf-8'),
         catalog_index_path(): json.dumps(index, indent=2, ensure_ascii=False).encode('utf-8'),
     }
+    records = []
+    seen_hashes = {}
     for page in pages:
-        files[page_path(product_id, page['pageNumber'])] = page['bytes']
+        duplicate_of = seen_hashes.get(page['sha256'])
+        if duplicate_of:
+            page['duplicateOf'] = duplicate_of
+        else:
+            seen_hashes[page['sha256']] = page['filename']
+            files[page_path(product_id, page['pageNumber'])] = page['bytes']
+        records.append({key: value for key, value in page.items() if key != 'bytes'})
     if cover:
-        files[cover_path(product_id)] = cover
-    return {'files': files, 'content': content, 'index': index, 'pages': pages, 'coverBytes': cover}
+        duplicate_of = seen_hashes.get(cover['sha256'])
+        if duplicate_of:
+            cover['duplicateOf'] = duplicate_of
+        else:
+            seen_hashes[cover['sha256']] = 'cover.webp'
+            files[cover_path(product_id)] = cover['bytes']
+        records.append({key: value for key, value in cover.items() if key != 'bytes'})
+    files[f'{catalog_root(product_id)}/imageOptimizationReport.json'] = report_json_bytes(records)
+    return {
+        'files': files,
+        'content': content,
+        'index': index,
+        'pages': pages,
+        'coverBytes': cover['bytes'] if cover else None,
+        'coverRecord': cover,
+        'optimization': summarize_records(records),
+    }

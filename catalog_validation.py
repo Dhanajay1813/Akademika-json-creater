@@ -7,6 +7,7 @@ import os
 from typing import Dict, List
 
 from catalog_builder import catalog_content_path, catalog_index_path, catalog_root
+from image_optimizer import relative_path_is_safe, sha256_bytes, validate_processed_image
 from product_catalog import get_categories
 
 
@@ -83,8 +84,20 @@ def validate_catalog_submission(metadata: Dict, generated: Dict) -> List[str]:
         expected_path = f'{root}{image_file}'
         if expected_path not in files:
             errors.append(f'Missing generated page image: {expected_path}')
-        if os.path.isabs(image_file) or '..' in image_file.split('/'):
+        if os.path.isabs(image_file) or '..' in image_file.split('/') or not relative_path_is_safe(image_file):
             errors.append(f'Unsafe image path: {image_file}')
+        if page.get('width') is not None and int(page.get('width') or 0) <= 0:
+            errors.append(f'Invalid page width: {image_file}')
+        if page.get('height') is not None and int(page.get('height') or 0) <= 0:
+            errors.append(f'Invalid page height: {image_file}')
+        if page.get('byteSize') is not None and int(page.get('byteSize') or 0) <= 0:
+            errors.append(f'Invalid page byteSize: {image_file}')
+        if expected_path in files:
+            data = files[expected_path]
+            if page.get('sha256') and sha256_bytes(data) != page.get('sha256'):
+                errors.append(f'SHA-256 mismatch for generated page image: {image_file}')
+            if page.get('byteSize') and len(data) != int(page.get('byteSize')):
+                errors.append(f'byteSize mismatch for generated page image: {image_file}')
 
     cover = content.get('coverImage')
     if cover:
@@ -98,6 +111,16 @@ def validate_catalog_submission(metadata: Dict, generated: Dict) -> List[str]:
         errors.append('catalogIndex.json is missing this product entry.')
     elif entry.get('contentFile') != expected_content:
         errors.append('catalogIndex entry points to the wrong catalogContent.json file.')
+
+    for page in pages:
+        processed_errors = validate_processed_image(page)
+        for error in processed_errors:
+            errors.append(f"Page {page.get('pageNumber')}: {error}")
+
+    cover_record = generated.get('coverRecord')
+    if cover_record:
+        for error in validate_processed_image(cover_record):
+            errors.append(f'Cover: {error}')
 
     if has_bad_payload(content) or has_bad_payload(index):
         errors.append('Generated JSON contains an absolute path or base64 data.')
