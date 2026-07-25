@@ -27,9 +27,29 @@ from content_builder import (
     build_submission_files,
     manual_content_destination,
     manual_index_destination,
+    manual_pdf_destination,
+    normalize_pdf_manual,
+)
+from pdf_optimizer import (
+    PDF_PROFILES,
+    PROFILE_HIGH_DETAIL,
+    estimate_compressed_size,
+    human_size as pdf_human_size,
+    optimize_pdf,
+    parse_page_ranges,
+    render_page_thumbnail,
+    validate_pdf,
 )
 from github_service import GitHubConfig, GitHubServiceError, submit_catalog_pull_request, submit_pull_request
 from validation import human_size, total_upload_size, validate_submission
+from image_optimizer import (
+    PROFILES,
+    human_size as image_human_size,
+    image_metadata,
+    optimize_image_bytes,
+    profile_for_context,
+    summarize_records,
+)
 from product_catalog import clean_id, clean_product_id, get_categories, get_category_names, get_product_defaults, get_products, product_count
 
 st.set_page_config(page_title='Akademika Manual Content Builder', layout='wide')
@@ -44,8 +64,18 @@ def init_state():
         st.session_state.manual = make_manual(defaults)
     if 'image_files' not in st.session_state:
         st.session_state.image_files = {}
+    if 'image_metadata' not in st.session_state:
+        st.session_state.image_metadata = {}
+    if 'image_optimization_records' not in st.session_state:
+        st.session_state.image_optimization_records = []
     if 'selected_experiment_index' not in st.session_state:
         st.session_state.selected_experiment_index = 0
+    if 'manual_pdf_original' not in st.session_state:
+        st.session_state.manual_pdf_original = None
+    if 'manual_pdf_optimized' not in st.session_state:
+        st.session_state.manual_pdf_optimized = None
+    if 'manual_pdf_profile' not in st.session_state:
+        st.session_state.manual_pdf_profile = PROFILE_HIGH_DETAIL
 
 
 def sync_manual_identity(defaults):
@@ -92,9 +122,45 @@ def block_image_files(block):
     return [image_file] if image_file else []
 
 
-def set_block_image_files(block, image_files):
-    block['imageFiles'] = image_files
-    block['imageFile'] = image_files[0] if image_files else ''
+def set_block_image_files(block, image_items):
+    block['imageFiles'] = image_items
+    first = image_items[0] if image_items else ''
+    block['imageFile'] = first.get('imageFile') if isinstance(first, dict) else first
+
+
+def existing_image_by_sha(manual_id, sha256):
+    for path, metadata in st.session_state.image_metadata.items():
+        if metadata.get('sha256') == sha256 and path.startswith(f'images/{manual_id}/'):
+            return path
+    return None
+
+
+def unique_relative_path(base_path):
+    if base_path not in st.session_state.image_files:
+        return base_path
+    stem, dot, ext = base_path.rpartition('.')
+    for index in range(2, 1000):
+        candidate = f'{stem}_{index}.{ext}' if dot else f'{base_path}_{index}'
+        if candidate not in st.session_state.image_files:
+            return candidate
+    raise RuntimeError(f'Could not create a unique image path for {base_path}')
+
+
+def optimization_summary(records=None):
+    summary = summarize_records(records if records is not None else st.session_state.image_optimization_records)
+    st.write(
+        f"Original: `{image_human_size(summary['originalTotalSize'])}` | "
+        f"Optimized: `{image_human_size(summary['optimizedTotalSize'])}` | "
+        f"Saved: `{image_human_size(summary['bytesSaved'])}` ({summary['percentSaved']:.1f}%)"
+    )
+    st.write(
+        f"Converted: `{summary['imagesConverted']}` | "
+        f"Left unchanged: `{summary['imagesLeftUnchanged']}` | "
+        f"Duplicates: `{summary['duplicatesDetected']}`"
+    )
+    warnings = [record.get('warning') for record in summary['records'] if record.get('warning')]
+    for warning in warnings:
+        st.warning(warning)
 
 
 def read_table_file(uploaded_file):
@@ -145,17 +211,31 @@ def submission_summary(config, manual, files):
     col1.write(f'**Manual ID:** `{manual_id}`')
     col1.write(f'**Product:** `{manual.get("productName") or "-"}`')
     col2.write(f'**Experiment count:** `{len(manual.get("experiments", []))}`')
-    col2.write(f'**Image count:** `{image_count}`')
+    if manual.get('contentMode') == 'pdfPageMapping':
+        col2.write(f'**Content mode:** `pdfPageMapping`')
+        col2.write(f'**PDF size:** `{pdf_human_size(manual.get("compressedByteSize") or 0)}`')
+    else:
+        col2.write(f'**Image count:** `{image_count}`')
     col2.write(f'**Total upload size:** `{human_size(total_upload_size(files))}`')
+    if st.session_state.image_optimization_records:
+        st.write('**Image optimization:**')
+        optimization_summary()
     st.write('**JSON destination paths:**')
-    st.code('\n'.join([manual_content_destination(manual_id), manual_index_destination()]), language='text')
+    paths = [manual_content_destination(manual_id), manual_index_destination()]
+    if manual.get('contentMode') == 'pdfPageMapping':
+        paths.insert(1, manual_pdf_destination(manual_id))
+    st.code('\n'.join(paths), language='text')
 
 
 def submit_panel():
     st.header('Submit to Akademika App')
     manual = st.session_state.manual
     config = github_config()
-    files = build_submission_files(manual, st.session_state.image_files)
+    try:
+        files = build_submission_files(manual, st.session_state.image_files)
+    except Exception as exc:
+        files = {}
+        st.warning(str(exc))
     submission_summary(config, manual, files)
 
     if config.dry_run:
@@ -288,25 +368,51 @@ def add_block_ui(experiment, section_key, blocks, technical=False):
                     accept_multiple_files=True,
                     key=upload_key,
                 )
+                default_profile = profile_for_context(section_key, technical)
+                profile = st.selectbox(
+                    'Advanced image type',
+                    list(PROFILES.keys()),
+                    index=list(PROFILES.keys()).index(default_profile),
+                    key=f'profile_{experiment["id"]}_{section_key}_{technical}_{index}',
+                )
                 if uploaded_files:
                     invalid_files = [uploaded.name for uploaded in uploaded_files if not extension_allowed(uploaded.name)]
                     if invalid_files:
                         st.error('Only png, jpg, jpeg, and webp images are allowed.')
                     else:
-                        signature = image_files_signature(uploaded_files)
+                        signature = image_files_signature(uploaded_files) + f'|{profile}'
                         if st.session_state.get(upload_state_key) != signature:
                             for old_image_file in block_image_files(block):
                                 st.session_state.image_files.pop(old_image_file, None)
-                            image_files = []
+                                st.session_state.image_metadata.pop(old_image_file, None)
+                            image_items = []
+                            records = []
                             total_files = len(uploaded_files)
                             for upload_index, uploaded in enumerate(uploaded_files):
-                                filename = indexed_image_filename(uploaded.name, upload_index, total_files)
-                                relative_path = image_path(manual_id, experiment['id'], section_key, filename, technical=technical)
-                                st.session_state.image_files[relative_path] = uploaded.getvalue()
-                                image_files.append(relative_path)
-                            set_block_image_files(block, image_files)
+                                original_name = indexed_image_filename(uploaded.name, upload_index, total_files)
+                                try:
+                                    optimized = optimize_image_bytes(uploaded.getvalue(), original_name, profile)
+                                except Exception as exc:
+                                    st.error(f'Could not optimize {uploaded.name}: {exc}')
+                                    continue
+                                duplicate_path = existing_image_by_sha(manual_id, optimized['sha256'])
+                                if duplicate_path:
+                                    relative_path = duplicate_path
+                                    optimized['duplicateOf'] = duplicate_path
+                                else:
+                                    relative_path = unique_relative_path(image_path(manual_id, experiment['id'], section_key, optimized['filename'], technical=technical))
+                                    st.session_state.image_files[relative_path] = optimized['bytes']
+                                metadata = image_metadata(relative_path, optimized)
+                                st.session_state.image_metadata[relative_path] = metadata
+                                image_items.append(metadata)
+                                record = {key: value for key, value in optimized.items() if key != 'bytes'}
+                                record['imageFile'] = relative_path
+                                records.append(record)
+                                st.session_state.image_optimization_records.append(record)
+                            set_block_image_files(block, image_items)
                             st.session_state[upload_state_key] = signature
-                            st.success(f'Added {len(image_files)} image(s) to this image block.')
+                            st.success(f'Added {len(image_items)} optimized image(s) to this image block.')
+                            optimization_summary(records)
                             st.rerun()
 
                 block['caption'] = st.text_input('Optional caption for all images', value=block.get('caption', ''), key=f'caption_{experiment["id"]}_{section_key}_{technical}_{index}')
@@ -381,14 +487,152 @@ def sidebar():
             payload = json.loads(uploaded_json.getvalue().decode('utf-8'))
             st.session_state.manual = load_manual_payload(payload)
             st.session_state.image_files = {}
+            st.session_state.image_metadata = {}
+            st.session_state.image_optimization_records = []
+            st.session_state.manual_pdf_original = None
+            st.session_state.manual_pdf_optimized = None
             st.session_state.selected_experiment_index = 0
-            st.sidebar.success('JSON loaded. Re-upload image files before ZIP export if this JSON contains image blocks.')
+            st.sidebar.success('JSON loaded. Upload the compressed manual PDF before submission if this is a PDF page-mapped manual.')
             st.rerun()
         except Exception as exc:
             st.sidebar.error(f'Could not load JSON: {exc}')
 
 
 
+
+
+def section_pages_editor(experiment, section_key, label, total_pages, technical=False):
+    sections = experiment.setdefault('sections', make_empty_sections())
+    container = sections.setdefault('technicalData', {}) if technical else sections
+    current = container.setdefault(section_key, {'pages': []})
+    default_value = ', '.join(str(page) for page in current.get('pages', []))
+    value = st.text_input(f'{label} page range', value=default_value, key=f'pages_{experiment["id"]}_{section_key}_{technical}')
+    try:
+        pages = parse_page_ranges(value, total_pages) if total_pages else []
+        current['pages'] = pages
+        if pages:
+            st.caption(f'Mapped pages: {", ".join(str(page) for page in pages)}')
+    except ValueError as exc:
+        st.error(str(exc))
+
+
+def preview_selected_pages(pdf_bytes, experiments):
+    pages = []
+    for experiment in experiments:
+        sections = experiment.get('sections', {})
+        for key in SECTION_KEYS:
+            pages.extend(sections.get(key, {}).get('pages', []))
+        for key in TECHNICAL_DATA_KEYS:
+            pages.extend(sections.get('technicalData', {}).get(key, {}).get('pages', []))
+    unique_pages = []
+    seen = set()
+    for page in pages:
+        if page not in seen:
+            seen.add(page)
+            unique_pages.append(page)
+    if not unique_pages or not pdf_bytes:
+        return
+    st.subheader('Temporary Selected-Page Preview')
+    st.caption('These low-resolution previews are not committed, stored in JSON, or sent to the mobile app.')
+    for page_number in unique_pages[:8]:
+        try:
+            st.image(render_page_thumbnail(pdf_bytes, page_number), caption=f'Manual page {page_number}', use_container_width=True)
+        except Exception as exc:
+            st.warning(f'Could not render page {page_number}: {exc}')
+
+
+def manual_pdf_panel():
+    manual = normalize_pdf_manual(st.session_state.manual)
+    st.session_state.manual = manual
+    uploaded_pdf = st.file_uploader('Complete manual PDF upload', type=['pdf'])
+    profile_keys = list(PDF_PROFILES.keys())
+    profile_key = st.selectbox(
+        'PDF compression profile',
+        profile_keys,
+        index=profile_keys.index(st.session_state.manual_pdf_profile if st.session_state.manual_pdf_profile in profile_keys else PROFILE_HIGH_DETAIL),
+        format_func=lambda key: PDF_PROFILES[key]['label'],
+    )
+    st.session_state.manual_pdf_profile = profile_key
+    st.caption(PDF_PROFILES[profile_key]['description'])
+
+    if uploaded_pdf is None and not st.session_state.manual_pdf_optimized:
+        st.info('Upload one complete source PDF for this manual.')
+        return False
+
+    if uploaded_pdf is not None:
+        source_bytes = uploaded_pdf.getvalue()
+        validation = validate_pdf(source_bytes)
+        st.subheader('PDF Upload')
+        col1, col2 = st.columns(2)
+        col1.write(f'**Filename:** `{uploaded_pdf.name}`')
+        col1.write(f'**Original size:** `{pdf_human_size(len(source_bytes))}`')
+        col1.write(f'**Estimated compressed size:** `{pdf_human_size(estimate_compressed_size(source_bytes, profile_key))}`')
+        col2.write(f'**Total pages:** `{validation.page_count}`')
+        col2.write(f'**Encrypted:** `{validation.encrypted}`')
+        col2.write(f'**PDF validity:** `{"Valid" if validation.valid else "Invalid"}`')
+        if not validation.valid:
+            st.error(validation.error or 'PDF could not be validated.')
+            return False
+        try:
+            optimized = optimize_pdf(source_bytes, profile_key)
+        except Exception as exc:
+            st.error(f'Could not compress PDF: {exc}')
+            return False
+        st.session_state.manual_pdf_original = source_bytes
+        st.session_state.manual_pdf_optimized = optimized
+        manual['originalFilename'] = uploaded_pdf.name
+        manual['totalPages'] = optimized['pageCount']
+        manual['compressedByteSize'] = optimized['compressedSize']
+        manual['sha256'] = optimized['sha256']
+        manual['pdfFile'] = 'manual.pdf'
+        manual['_pdfBytes'] = optimized['bytes']
+
+    optimized = st.session_state.manual_pdf_optimized
+    if optimized:
+        manual['_pdfBytes'] = optimized['bytes']
+        st.subheader('Compression Summary')
+        cols = st.columns(3)
+        cols[0].metric('Original PDF size', pdf_human_size(optimized['originalSize']))
+        cols[1].metric('Compressed PDF size', pdf_human_size(optimized['compressedSize']))
+        cols[2].metric('Reduction', f"{pdf_human_size(optimized['bytesSaved'])} ({optimized['percentSaved']:.1f}%)")
+        st.write(f"**Profile:** `{optimized['profileLabel']}` | **Page count:** `{optimized['pageCount']}` | **SHA-256:** `{optimized['sha256']}`")
+        st.write(f"**Oversized raster images rewritten:** `{optimized['rewrittenImages']}`")
+        if optimized.get('warning'):
+            st.warning(optimized['warning'])
+        if optimized['compressedSize'] > 40 * 1024 * 1024:
+            st.warning('Compressed PDF remains unusually large for a bundled mobile asset.')
+        if optimized.get('blankPages'):
+            st.warning(f"Blank pages detected: {', '.join(str(page) for page in optimized['blankPages'])}")
+
+    return bool(st.session_state.manual_pdf_optimized)
+
+
+def pdf_mapping_editor():
+    manual = st.session_state.manual
+    total_pages = int(manual.get('totalPages') or 0)
+    if st.button('Add Experiment'):
+        add_experiment()
+        st.rerun()
+    experiment = current_experiment()
+    if experiment is None:
+        st.info('Add an experiment to map PDF pages.')
+        return
+    st.header('Experiment Page Mapping')
+    cols = st.columns(4)
+    experiment['id'] = cols[0].text_input('Experiment ID', value=experiment.get('id') or clean_slug(experiment.get('experimentNumber', ''), 'exp1'))
+    experiment['experimentNumber'] = cols[1].text_input('Experiment Number', value=experiment.get('experimentNumber', ''))
+    experiment['title'] = cols[2].text_input('Experiment Title', value=experiment.get('title', ''))
+    experiment['displayOrder'] = cols[3].number_input('Display Order', min_value=1, step=1, value=int(experiment.get('displayOrder') or 1))
+    tabs = st.tabs([SECTION_LABELS[key] for key in SECTION_KEYS] + ['Technical Data'])
+    for tab, section_key in zip(tabs[:len(SECTION_KEYS)], SECTION_KEYS):
+        with tab:
+            section_pages_editor(experiment, section_key, SECTION_LABELS[section_key], total_pages)
+    with tabs[-1]:
+        tech_tabs = st.tabs([TECHNICAL_DATA_LABELS[key] for key in TECHNICAL_DATA_KEYS])
+        for tab, key in zip(tech_tabs, TECHNICAL_DATA_KEYS):
+            with tab:
+                section_pages_editor(experiment, key, TECHNICAL_DATA_LABELS[key], total_pages, technical=True)
+    preview_selected_pages(manual.get('_pdfBytes'), manual.get('experiments', []))
 
 def catalog_max_pdf_bytes():
     catalog = st.secrets.get('catalog', {})
@@ -469,6 +713,8 @@ def catalog_panel():
     col2.write(f'**Generated image count:** `{len(generated["pages"])}`')
     col2.write(f'**Total generated size:** `{catalog_human_size(total_size)}`')
     col2.write(f'**Submission type:** `{"Update" if is_update else "New catalog or update check on submit"}`')
+    st.write('**Image optimization:**')
+    optimization_summary(generated.get('optimization', {}).get('records', []))
 
     st.write('**Destination paths:**')
     st.code('\n'.join(sorted(files)), language='text')
@@ -566,33 +812,10 @@ def main():
     summary_cols[0].metric('Category', manual.get('categoryName') or '-')
     summary_cols[1].metric('Product ID', manual.get('productId') or '-')
     summary_cols[2].metric('Manual ID', manual.get('manualId') or '-')
-    summary_cols[3].metric('Content Blocks', count_blocks(manual))
+    summary_cols[3].metric('Mapped Pages', count_blocks(manual))
 
-    experiment = current_experiment()
-    if experiment is None:
-        st.info('Use Add Experiment in the sidebar to begin.')
-        export_panel()
-        submit_panel()
-        return
-
-    st.header('Experiment')
-    exp_cols = st.columns(3)
-    experiment['id'] = exp_cols[0].text_input('Experiment ID', value=experiment.get('id') or clean_slug(experiment.get('experimentNumber', ''), 'exp1'))
-    experiment['experimentNumber'] = exp_cols[1].text_input('Experiment Number', value=experiment.get('experimentNumber', ''))
-    experiment['title'] = exp_cols[2].text_input('Experiment Title', value=experiment.get('title', ''))
-    experiment.setdefault('sections', make_empty_sections())
-
-    section_tabs = st.tabs([SECTION_LABELS[key] for key in SECTION_KEYS] + ['Technical Data'])
-    for tab, section_key in zip(section_tabs[:len(SECTION_KEYS)], SECTION_KEYS):
-        with tab:
-            section_editor(experiment, section_key, SECTION_LABELS[section_key])
-
-    with section_tabs[-1]:
-        tech_tabs = st.tabs([TECHNICAL_DATA_LABELS[key] for key in TECHNICAL_DATA_KEYS])
-        experiment['sections'].setdefault('technicalData', {})
-        for tab, subsection_key in zip(tech_tabs, TECHNICAL_DATA_KEYS):
-            with tab:
-                section_editor(experiment, subsection_key, TECHNICAL_DATA_LABELS[subsection_key], technical=True)
+    if manual_pdf_panel():
+        pdf_mapping_editor()
 
     export_panel()
     submit_panel()

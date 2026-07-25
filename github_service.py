@@ -24,6 +24,7 @@ class GitHubConfig:
     repo: str
     base_branch: str
     dry_run: bool = True
+    auto_merge: bool = False
 
     @property
     def repo_full_name(self) -> str:
@@ -127,6 +128,12 @@ class GitHubService:
             'body': body,
         })
 
+    def merge_pull_request(self, number: int, message: str):
+        return self._request('PUT', f'/pulls/{number}/merge', json={
+            'commit_title': message,
+            'merge_method': 'merge',
+        })
+
 
 def timestamp_slug() -> str:
     return datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
@@ -188,12 +195,16 @@ def submit_pull_request(config: GitHubConfig, manual: Dict, files: Dict[str, byt
         title=f'Add manual content for {manual_id}',
         body='Generated manual content submitted from the Akademika Streamlit editor.',
     )
+    merged = False
+    merge_commit_sha = None
     return {
         'dry_run': False,
         'branch': branch,
         'base_sha': base_sha,
         'files': sorted(planned),
         'pull_request_url': pr.get('html_url'),
+        'merged': merged,
+        'merge_commit_sha': merge_commit_sha,
     }
 
 
@@ -237,6 +248,12 @@ def submit_catalog_pull_request(config: GitHubConfig, metadata: Dict, files: Dic
         title=f'Add catalog for {product_name}',
         body='Generated product catalog submitted from the Akademika Streamlit editor.',
     )
+    merged = False
+    merge_commit_sha = None
+    if config.auto_merge:
+        merge = service.merge_pull_request(pr['number'], f'Merge catalog for {product_name}')
+        merged = bool(merge.get('merged'))
+        merge_commit_sha = merge.get('sha')
     return {
         'dry_run': False,
         'branch': branch,
@@ -244,4 +261,6 @@ def submit_catalog_pull_request(config: GitHubConfig, metadata: Dict, files: Dic
         'files': sorted(planned),
         'pull_request_url': pr.get('html_url'),
         'is_update': is_update,
+        'merged': merged,
+        'merge_commit_sha': merge_commit_sha,
     }
