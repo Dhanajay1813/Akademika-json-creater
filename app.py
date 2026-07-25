@@ -590,10 +590,15 @@ def selected_library_pdf(defaults, profile_key):
     options = candidates if candidates else records
     if not candidates:
         st.warning('No confident PDF match was found for this product. Select from all library PDFs.')
+    def format_candidate_manual(record):
+        match_type = record.get('matchType')
+        prefix = f"[{match_type}] " if match_type else ''
+        return f"{prefix}{record['relativePath']} ({pdf_human_size(record['byteSize'])})"
+
     selected = st.selectbox(
         'Product manual PDF',
         options,
-        format_func=lambda record: f"{record['relativePath']} ({pdf_human_size(record['byteSize'])})",
+        format_func=format_candidate_manual,
     )
     return selected
 
