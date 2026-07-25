@@ -245,11 +245,16 @@ def submit_panel():
     st.header('Submit to Akademika App')
     manual = st.session_state.manual
     config = github_config()
+    files = {}
+    files_ready = True
     try:
         files = build_submission_files(manual, st.session_state.image_files)
     except Exception as exc:
-        files = {}
-        st.warning(str(exc))
+        files_ready = False
+        if manual.get('contentMode') == 'pdfPageMapping':
+            st.info('Select a manual PDF from the library or upload one above so Streamlit can create the compressed manual.pdf for this submission.')
+        else:
+            st.warning(str(exc))
     submission_summary(config, manual, files)
 
     if config.dry_run:
@@ -264,7 +269,7 @@ def submit_panel():
             for warning in warnings:
                 st.write(f'- {warning}')
 
-    if st.button('Submit Pull Request', disabled=bool(errors)):
+    if st.button('Submit Pull Request', disabled=bool(errors) or not files_ready):
         if errors:
             for error in errors:
                 st.error(error)

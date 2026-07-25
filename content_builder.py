@@ -133,7 +133,6 @@ def normalize_page_section(value) -> Dict:
 
 
 def normalize_pdf_manual(manual: Dict) -> Dict:
-    manual.pop('_pdfBytes', None)
     manual.setdefault('schemaVersion', 3)
     manual['contentMode'] = 'pdfPageMapping'
     manual.setdefault('pdfFile', 'manual.pdf')
@@ -171,7 +170,9 @@ def block_image_items(block: Dict) -> List[Dict]:
 
 def submitted_manual_payload(manual: Dict) -> Dict:
     if is_pdf_page_mapping(manual):
-        return make_content_payload(normalize_pdf_manual(copy.deepcopy(manual)))
+        manual_copy = normalize_pdf_manual(copy.deepcopy(manual))
+        manual_copy.pop('_pdfBytes', None)
+        return make_content_payload(manual_copy)
     payload = make_content_payload(manual)
     manual_id = manual.get('manualId', '')
     manual_copy = payload['manuals'].get(manual_id, {})
