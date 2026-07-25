@@ -606,14 +606,35 @@ def experiment_page_count(experiment):
 def experiment_coverage_panel():
     manual = st.session_state.manual
     experiments = manual.setdefault('experiments', [])
-    st.subheader('Experiment Coverage')
+    st.subheader('Experiment Setup')
     target_count = st.number_input('Experiments in this manual', min_value=1, max_value=80, step=1, value=max(1, len(experiments) or 1))
-    if st.button('Create missing experiment rows'):
+    cols = st.columns(2)
+    if cols[0].button('Create / Open Experiment Rows'):
         while len(experiments) < int(target_count):
             experiments.append(make_experiment(len(experiments) + 1))
+        if not experiments:
+            experiments.append(make_experiment(1))
         if st.session_state.selected_experiment_index >= len(experiments):
             st.session_state.selected_experiment_index = max(0, len(experiments) - 1)
         st.rerun()
+    if cols[1].button('Add One More Experiment'):
+        experiments.append(make_experiment(len(experiments) + 1))
+        st.session_state.selected_experiment_index = len(experiments) - 1
+        st.rerun()
+    if not experiments:
+        experiments.append(make_experiment(1))
+        st.session_state.selected_experiment_index = 0
+
+    labels = [f"{exp.get('experimentNumber') or exp.get('id')} - {exp.get('title') or 'Untitled'}" for exp in experiments]
+    current_index = min(st.session_state.selected_experiment_index, len(labels) - 1)
+    st.session_state.selected_experiment_index = st.selectbox(
+        'Open experiment for page assignment',
+        range(len(labels)),
+        format_func=lambda i: labels[i],
+        index=current_index,
+        key='main_experiment_selector',
+    )
+
     rows = []
     for experiment in experiments:
         mapped = experiment_page_count(experiment)
@@ -625,15 +646,15 @@ def experiment_coverage_panel():
             'Status': 'Mapped' if mapped else 'Needs pages',
             'Core gaps': ', '.join(missing_core),
         })
-    if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
 def section_pages_editor(experiment, section_key, label, total_pages, technical=False):
     sections = experiment.setdefault('sections', make_empty_sections())
     container = sections.setdefault('technicalData', {}) if technical else sections
     current = container.setdefault(section_key, {'pages': []})
     default_value = ', '.join(str(page) for page in current.get('pages', []))
-    value = st.text_input(f'{label} page range', value=default_value, key=f'pages_{experiment["id"]}_{section_key}_{technical}')
+    st.caption('Enter PDF page numbers from the selected manual, for example: 4, 7-9, 12')
+    value = st.text_input(f'{label} PDF page numbers', value=default_value, key=f'pages_{experiment["id"]}_{section_key}_{technical}')
     try:
         pages = parse_page_ranges(value, total_pages) if total_pages else []
         current['pages'] = pages
@@ -734,19 +755,17 @@ def pdf_mapping_editor():
     manual = st.session_state.manual
     total_pages = int(manual.get('totalPages') or 0)
     experiment_coverage_panel()
-    if st.button('Add Experiment'):
-        add_experiment()
-        st.rerun()
     experiment = current_experiment()
     if experiment is None:
         st.info('Add an experiment to map PDF pages.')
         return
-    st.header('Experiment Page Mapping')
+    st.header('Assign Pages for Selected Experiment')
     cols = st.columns(4)
     experiment['id'] = cols[0].text_input('Experiment ID', value=experiment.get('id') or clean_slug(experiment.get('experimentNumber', ''), 'exp1'))
     experiment['experimentNumber'] = cols[1].text_input('Experiment Number', value=experiment.get('experimentNumber', ''))
     experiment['title'] = cols[2].text_input('Experiment Title', value=experiment.get('title', ''))
     experiment['displayOrder'] = cols[3].number_input('Display Order', min_value=1, step=1, value=int(experiment.get('displayOrder') or 1))
+    st.caption('Use these tabs to index the selected manual PDF. The mobile app will show only the pages mapped here for each section.')
     tabs = st.tabs([SECTION_LABELS[key] for key in SECTION_KEYS] + ['Technical Data'])
     for tab, section_key in zip(tabs[:len(SECTION_KEYS)], SECTION_KEYS):
         with tab:
