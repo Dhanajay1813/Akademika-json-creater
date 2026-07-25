@@ -693,8 +693,7 @@ def section_pages_editor(experiment, section_key, label, total_pages, technical=
         current['pages'] = pages
         if pages:
             st.caption(f'Mapped pages: {", ".join(str(page) for page in pages)}')
-            if st.checkbox(f'Preview {label} mapped PDF pages', value=True, key=f'preview_{experiment["id"]}_{section_key}_{technical}'):
-                render_page_preview_grid(st.session_state.manual.get('_pdfBytes'), pages, label)
+            render_page_preview_grid(st.session_state.manual.get('_pdfBytes'), pages, label)
     except ValueError as exc:
         st.error(str(exc))
 
