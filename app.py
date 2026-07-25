@@ -687,7 +687,10 @@ def section_pages_editor(experiment, section_key, label, total_pages, technical=
     current = container.setdefault(section_key, {'pages': []})
     default_value = ', '.join(str(page) for page in current.get('pages', []))
     st.caption('Enter PDF page numbers from the selected manual, for example: 4, 7-9, 12')
-    value = st.text_input(f'{label} PDF page numbers', value=default_value, key=f'pages_{experiment["id"]}_{section_key}_{technical}')
+    pdf_ready = bool(total_pages and st.session_state.manual.get('_pdfBytes'))
+    if not pdf_ready:
+        st.info('Load a manual PDF above to enable page-number assignment and previews.')
+    value = st.text_input(f'{label} PDF page numbers', value=default_value, key=f'pages_{experiment["id"]}_{section_key}_{technical}', disabled=not pdf_ready)
     try:
         pages = parse_page_ranges(value, total_pages) if total_pages else []
         current['pages'] = pages
@@ -753,6 +756,13 @@ def manual_pdf_panel():
             except OSError as exc:
                 st.error(f'Could not read selected library PDF: {exc}')
                 return False
+        else:
+            st.info('The library folder is not available here. Upload the selected product manual below to continue mapping.')
+            uploaded_pdf = st.file_uploader('Upload product manual PDF for mapping', type=['pdf'], key='library_fallback_pdf')
+            if uploaded_pdf is not None:
+                source_bytes = uploaded_pdf.getvalue()
+                source_name = uploaded_pdf.name
+                source_signature = f"fallback-upload:{uploaded_pdf.name}:{getattr(uploaded_pdf, 'size', len(source_bytes))}:{profile_key}"
     else:
         uploaded_pdf = st.file_uploader('Complete manual PDF upload', type=['pdf'])
         if uploaded_pdf is not None:
@@ -761,7 +771,7 @@ def manual_pdf_panel():
             source_signature = f"upload:{uploaded_pdf.name}:{getattr(uploaded_pdf, 'size', len(source_bytes))}:{profile_key}"
 
     if source_bytes is None:
-        st.info('Select a product manual from the library or upload one complete source PDF.')
+        st.info('Select a product manual from the library or upload one complete source PDF. You can still set up experiments below; page fields unlock after the PDF is loaded.')
         return False
 
     optimized = compress_selected_pdf(source_bytes, source_name, source_signature, profile_key, manual)
@@ -954,7 +964,12 @@ def export_panel():
                 st.write(f'- {warning}')
 
     payload_bytes = json_bytes(st.session_state.manual)
-    zip_payload = zip_bytes(st.session_state.manual, st.session_state.image_files)
+    zip_payload = b''
+    export_ready = True
+    try:
+        zip_payload = zip_bytes(st.session_state.manual, st.session_state.image_files)
+    except Exception:
+        export_ready = False
     manual_id = st.session_state.manual.get('manualId') or 'manual'
     cols = st.columns(2)
     cols[0].download_button(
@@ -969,8 +984,10 @@ def export_panel():
         data=zip_payload,
         file_name=f'{manual_id}_content_pack.zip',
         mime='application/zip',
-        disabled=bool(errors),
+        disabled=bool(errors) or not export_ready,
     )
+    if not export_ready:
+        st.info('Load and compress a manual PDF before downloading the final ZIP.')
 
     with st.expander('JSON Preview'):
         st.json(json.loads(payload_bytes.decode('utf-8')))
@@ -994,8 +1011,8 @@ def main():
     summary_cols[2].metric('Manual ID', manual.get('manualId') or '-')
     summary_cols[3].metric('Mapped Pages', count_blocks(manual))
 
-    if manual_pdf_panel():
-        pdf_mapping_editor()
+    manual_pdf_panel()
+    pdf_mapping_editor()
 
     export_panel()
     submit_panel()
