@@ -603,13 +603,21 @@ def selected_library_pdf(defaults, profile_key):
     return selected
 
 
+def section_content_total(section):
+    if isinstance(section, dict):
+        return len(section.get('pages', [])) + len(section.get('blocks', []))
+    if isinstance(section, list):
+        return len(section)
+    return 0
+
+
 def experiment_page_count(experiment):
     sections = experiment.get('sections', {})
     total = 0
     for key in SECTION_KEYS:
-        total += len(sections.get(key, {}).get('pages', []))
+        total += section_content_total(sections.get(key, {}))
     for key in TECHNICAL_DATA_KEYS:
-        total += len(sections.get('technicalData', {}).get(key, {}).get('pages', []))
+        total += section_content_total(sections.get('technicalData', {}).get(key, {}))
     return total
 
 
@@ -648,12 +656,12 @@ def experiment_coverage_panel():
     rows = []
     for experiment in experiments:
         mapped = experiment_page_count(experiment)
-        missing_core = [SECTION_LABELS[key] for key in ('objective', 'theory', 'procedure') if not experiment.get('sections', {}).get(key, {}).get('pages')]
+        missing_core = [SECTION_LABELS[key] for key in ('objective', 'theory', 'procedure') if section_content_total(experiment.get('sections', {}).get(key, {})) == 0]
         rows.append({
             'Experiment': experiment.get('experimentNumber') or experiment.get('id'),
             'Title': experiment.get('title') or 'Untitled',
-            'Mapped pages': mapped,
-            'Status': 'Mapped' if mapped else 'Needs pages',
+            'Section content': mapped,
+            'Status': 'Ready' if mapped else 'Needs content',
             'Core gaps': ', '.join(missing_core),
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)
@@ -679,17 +687,26 @@ def mapped_section_rows(experiment):
     sections = experiment.get('sections', {})
     rows = []
     for key in SECTION_KEYS:
-        pages = sections.get(key, {}).get('pages', [])
-        rows.append({'Section': SECTION_LABELS[key], 'Pages': ', '.join(str(page) for page in pages) or '-'})
+        section = sections.get(key, {})
+        pages = section.get('pages', []) if isinstance(section, dict) else []
+        blocks = section.get('blocks', []) if isinstance(section, dict) else section if isinstance(section, list) else []
+        rows.append({'Section': SECTION_LABELS[key], 'PDF pages': ', '.join(str(page) for page in pages) or '-', 'Custom blocks': len(blocks)})
     for key in TECHNICAL_DATA_KEYS:
-        pages = sections.get('technicalData', {}).get(key, {}).get('pages', [])
-        rows.append({'Section': f'Technical Data - {TECHNICAL_DATA_LABELS[key]}', 'Pages': ', '.join(str(page) for page in pages) or '-'})
+        section = sections.get('technicalData', {}).get(key, {})
+        pages = section.get('pages', []) if isinstance(section, dict) else []
+        blocks = section.get('blocks', []) if isinstance(section, dict) else section if isinstance(section, list) else []
+        rows.append({'Section': f'Technical Data - {TECHNICAL_DATA_LABELS[key]}', 'PDF pages': ', '.join(str(page) for page in pages) or '-', 'Custom blocks': len(blocks)})
     return rows
 
 def section_pages_editor(experiment, section_key, label, total_pages, technical=False):
     sections = experiment.setdefault('sections', make_empty_sections())
     container = sections.setdefault('technicalData', {}) if technical else sections
-    current = container.setdefault(section_key, {'pages': []})
+    current = container.setdefault(section_key, {'pages': [], 'blocks': []})
+    if isinstance(current, list):
+        current = {'pages': [], 'blocks': current}
+        container[section_key] = current
+    current.setdefault('pages', [])
+    current.setdefault('blocks', [])
     default_value = ', '.join(str(page) for page in current.get('pages', []))
     st.caption('Enter PDF page numbers from the selected manual, for example: 4, 7-9, 12')
     pdf_ready = bool(total_pages and st.session_state.manual.get('_pdfBytes'))
@@ -704,6 +721,10 @@ def section_pages_editor(experiment, section_key, label, total_pages, technical=
             render_page_preview_grid(st.session_state.manual.get('_pdfBytes'), pages, label)
     except ValueError as exc:
         st.error(str(exc))
+
+    with st.expander(f'Add custom {label} content', expanded=not current.get('pages') and bool(current.get('blocks'))):
+        st.caption('Use this when a section should be text, images, notes, or tables instead of repeating the same PDF page in multiple sections.')
+        add_block_ui(experiment, section_key, current.setdefault('blocks', []), technical=technical)
 
 
 def preview_selected_pages(pdf_bytes, experiments):
@@ -814,7 +835,7 @@ def pdf_mapping_editor():
     experiment['experimentNumber'] = cols[1].text_input('Experiment Number', value=experiment.get('experimentNumber', ''))
     experiment['title'] = cols[2].text_input('Experiment Title', value=experiment.get('title', ''))
     experiment['displayOrder'] = cols[3].number_input('Display Order', min_value=1, step=1, value=int(experiment.get('displayOrder') or 1))
-    st.caption('Use these tabs to index the selected manual PDF. The mobile app will show only the pages mapped here for each section.')
+    st.caption('Use these tabs to choose section content. Each section can use mapped PDF pages, custom text/images/tables, or both.')
     with st.expander('Selected experiment mapping review', expanded=True):
         st.dataframe(mapped_section_rows(experiment), use_container_width=True, hide_index=True)
     tabs = st.tabs([SECTION_LABELS[key] for key in SECTION_KEYS] + ['Technical Data'])

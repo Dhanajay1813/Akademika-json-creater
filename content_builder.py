@@ -66,10 +66,14 @@ def extension_allowed(filename: str) -> bool:
     return ext in IMAGE_EXTENSIONS
 
 
+def make_empty_page_section() -> Dict:
+    return {'pages': [], 'blocks': []}
+
+
 def make_empty_sections() -> Dict:
     return {
-        **{key: {'pages': []} for key in SECTION_KEYS},
-        'technicalData': {key: {'pages': []} for key in TECHNICAL_DATA_KEYS},
+        **{key: make_empty_page_section() for key in SECTION_KEYS},
+        'technicalData': {key: make_empty_page_section() for key in TECHNICAL_DATA_KEYS},
     }
 
 
@@ -113,10 +117,16 @@ def is_pdf_page_mapping(manual: Dict) -> bool:
 
 
 def normalize_page_section(value) -> Dict:
+    blocks = []
     if isinstance(value, dict):
         pages = value.get('pages', [])
+        raw_blocks = value.get('blocks', [])
+        blocks = raw_blocks if isinstance(raw_blocks, list) else []
     elif isinstance(value, list) and all(isinstance(item, int) for item in value):
         pages = value
+    elif isinstance(value, list):
+        pages = []
+        blocks = value
     else:
         pages = []
     normalized = []
@@ -129,7 +139,7 @@ def normalize_page_section(value) -> Dict:
         if number > 0 and number not in seen:
             seen.add(number)
             normalized.append(number)
-    return {'pages': normalized}
+    return {'pages': normalized, 'blocks': blocks}
 
 
 def normalize_pdf_manual(manual: Dict) -> Dict:
@@ -169,14 +179,12 @@ def block_image_items(block: Dict) -> List[Dict]:
 
 
 def submitted_manual_payload(manual: Dict) -> Dict:
-    if is_pdf_page_mapping(manual):
-        manual_copy = normalize_pdf_manual(copy.deepcopy(manual))
-        manual_copy.pop('_pdfBytes', None)
-        return make_content_payload(manual_copy)
-    payload = make_content_payload(manual)
+    manual_copy = normalize_pdf_manual(copy.deepcopy(manual)) if is_pdf_page_mapping(manual) else copy.deepcopy(manual)
+    manual_copy.pop('_pdfBytes', None)
+    payload = make_content_payload(manual_copy)
     manual_id = manual.get('manualId', '')
-    manual_copy = payload['manuals'].get(manual_id, {})
-    for _, _, block in iter_blocks(manual_copy):
+    manual_payload = payload['manuals'].get(manual_id, {})
+    for _, _, block in iter_blocks(manual_payload):
         if block.get('type') == 'image':
             image_items = block_image_items(block)
             if image_items:
@@ -295,18 +303,18 @@ def build_content_registry(manual: Dict, image_files: Dict[str, bytes]) -> bytes
 
 def build_submission_files(manual: Dict, image_files: Dict[str, bytes]) -> Dict[str, bytes]:
     manual_id = manual.get('manualId') or 'manual'
+    files = {manual_content_destination(manual_id): submitted_json_bytes(manual)}
     if is_pdf_page_mapping(manual):
         pdf_bytes = manual.get('_pdfBytes')
         if not pdf_bytes:
             raise ValueError('Compressed manual PDF is missing.')
-        return {
-            manual_content_destination(manual_id): submitted_json_bytes(manual),
-            manual_pdf_destination(manual_id): pdf_bytes,
-        }
-    files = {
-        manual_content_destination(manual_id): submitted_json_bytes(manual),
-        content_registry_destination(): build_content_registry(manual, image_files),
-    }
+        files[manual_pdf_destination(manual_id)] = pdf_bytes
+        if image_files:
+            files[content_registry_destination()] = build_content_registry(manual, image_files)
+            for image_file, content in sorted(image_files.items()):
+                files[submission_image_destination(manual_id, image_file)] = content
+        return files
+    files[content_registry_destination()] = build_content_registry(manual, image_files)
     for image_file, content in sorted(image_files.items()):
         files[submission_image_destination(manual_id, image_file)] = content
     return files
@@ -348,15 +356,29 @@ def build_manual_index(existing_index, manual: Dict) -> Dict:
     return {'manuals': manuals}
 
 
+def section_blocks(value) -> List[Dict]:
+    if isinstance(value, dict):
+        blocks = value.get('blocks', [])
+        return blocks if isinstance(blocks, list) else []
+    if isinstance(value, list) and not all(isinstance(item, int) for item in value):
+        return value
+    return []
+
+
+def section_content_count(value) -> int:
+    normalized = normalize_page_section(value)
+    return len(normalized.get('pages', [])) + len(section_blocks(normalized))
+
+
 def iter_blocks(manual: Dict) -> Iterable[Tuple[str, str, Dict]]:
     for experiment in manual.get('experiments', []):
         exp_id = experiment.get('id', '')
         sections = experiment.get('sections', {})
         for section_key in SECTION_KEYS:
-            for block in sections.get(section_key, []):
+            for block in section_blocks(sections.get(section_key)):
                 yield exp_id, section_key, block
         for subsection_key in TECHNICAL_DATA_KEYS:
-            for block in sections.get('technicalData', {}).get(subsection_key, []):
+            for block in section_blocks(sections.get('technicalData', {}).get(subsection_key)):
                 yield exp_id, f'technicalData/{subsection_key}', block
 
 
@@ -366,9 +388,9 @@ def count_blocks(manual: Dict) -> int:
         for experiment in manual.get('experiments', []):
             sections = experiment.get('sections', {})
             for key in SECTION_KEYS:
-                total += len(normalize_page_section(sections.get(key)).get('pages', []))
+                total += section_content_count(sections.get(key))
             for key in TECHNICAL_DATA_KEYS:
-                total += len(normalize_page_section(sections.get('technicalData', {}).get(key)).get('pages', []))
+                total += section_content_count(sections.get('technicalData', {}).get(key))
         return total
     return sum(1 for _ in iter_blocks(manual))
 
@@ -406,15 +428,19 @@ def validate_manual(manual: Dict, image_files: Dict[str, bytes]) -> Tuple[List[s
         if not manual.get('sha256'):
             errors.append('Compressed PDF SHA-256 is required.')
         seen_pages = False
+        seen_content = False
         for experiment in experiments:
             sections = experiment.get('sections', {})
-            experiment_page_count = 0
+            experiment_content_count = 0
             missing_core = []
             for key in SECTION_KEYS:
-                pages = normalize_page_section(sections.get(key)).get('pages', [])
+                section = normalize_page_section(sections.get(key))
+                pages = section.get('pages', [])
+                blocks = section_blocks(section)
                 seen_pages = seen_pages or bool(pages)
-                experiment_page_count += len(pages)
-                if key in ('objective', 'theory', 'procedure') and not pages:
+                seen_content = seen_content or bool(pages or blocks)
+                experiment_content_count += len(pages) + len(blocks)
+                if key in ('objective', 'theory', 'procedure') and not pages and not blocks:
                     missing_core.append(SECTION_LABELS[key])
                 for page in pages:
                     if page <= 0:
@@ -422,23 +448,26 @@ def validate_manual(manual: Dict, image_files: Dict[str, bytes]) -> Tuple[List[s
                     if total_pages and page > total_pages:
                         errors.append(f'{experiment.get("id")}.{key} page {page} exceeds total pages {total_pages}.')
             for key in TECHNICAL_DATA_KEYS:
-                pages = normalize_page_section(sections.get('technicalData', {}).get(key)).get('pages', [])
+                section = normalize_page_section(sections.get('technicalData', {}).get(key))
+                pages = section.get('pages', [])
+                blocks = section_blocks(section)
                 seen_pages = seen_pages or bool(pages)
-                experiment_page_count += len(pages)
+                seen_content = seen_content or bool(pages or blocks)
+                experiment_content_count += len(pages) + len(blocks)
                 for page in pages:
                     if page <= 0:
                         errors.append(f'{experiment.get("id")}.technicalData.{key} contains page 0 or a negative page.')
                     if total_pages and page > total_pages:
                         errors.append(f'{experiment.get("id")}.technicalData.{key} page {page} exceeds total pages {total_pages}.')
-            if experiment_page_count == 0:
-                errors.append(f'{experiment.get("experimentNumber") or experiment.get("id")}: map at least one PDF page before submission.')
+            if experiment_content_count == 0:
+                errors.append(f'{experiment.get("experimentNumber") or experiment.get("id")}: add at least one mapped PDF page or custom content block before submission.')
             elif missing_core:
-                warnings.append(f'{experiment.get("experimentNumber") or experiment.get("id")}: missing core mappings for {", ".join(missing_core)}.')
+                warnings.append(f'{experiment.get("experimentNumber") or experiment.get("id")}: missing core content for {", ".join(missing_core)}.')
+        if not seen_content:
+            errors.append('At least one mapped PDF page or custom content block is required.')
         if not seen_pages:
-            errors.append('At least one mapped PDF page is required.')
-        return errors, warnings
-
-    if count_blocks(manual) == 0:
+            warnings.append('No PDF pages are mapped. This manual will rely only on custom section content blocks.')
+    elif count_blocks(manual) == 0:
         errors.append('At least one content block is required.')
 
     seen_hashes = {}
@@ -503,6 +532,8 @@ def zip_bytes(manual: Dict, image_files: Dict[str, bytes]) -> bytes:
             pdf_bytes = manual.get('_pdfBytes')
             if pdf_bytes:
                 archive.writestr('manual.pdf', pdf_bytes)
+            for path, content in sorted(image_files.items()):
+                archive.writestr(path, content)
             buffer.seek(0)
             return buffer.getvalue()
         archive.writestr('images/', b'')
