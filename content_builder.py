@@ -407,9 +407,14 @@ def validate_manual(manual: Dict, image_files: Dict[str, bytes]) -> Tuple[List[s
         seen_pages = False
         for experiment in experiments:
             sections = experiment.get('sections', {})
+            experiment_page_count = 0
+            missing_core = []
             for key in SECTION_KEYS:
                 pages = normalize_page_section(sections.get(key)).get('pages', [])
                 seen_pages = seen_pages or bool(pages)
+                experiment_page_count += len(pages)
+                if key in ('objective', 'theory', 'procedure') and not pages:
+                    missing_core.append(SECTION_LABELS[key])
                 for page in pages:
                     if page <= 0:
                         errors.append(f'{experiment.get("id")}.{key} contains page 0 or a negative page.')
@@ -418,11 +423,16 @@ def validate_manual(manual: Dict, image_files: Dict[str, bytes]) -> Tuple[List[s
             for key in TECHNICAL_DATA_KEYS:
                 pages = normalize_page_section(sections.get('technicalData', {}).get(key)).get('pages', [])
                 seen_pages = seen_pages or bool(pages)
+                experiment_page_count += len(pages)
                 for page in pages:
                     if page <= 0:
                         errors.append(f'{experiment.get("id")}.technicalData.{key} contains page 0 or a negative page.')
                     if total_pages and page > total_pages:
                         errors.append(f'{experiment.get("id")}.technicalData.{key} page {page} exceeds total pages {total_pages}.')
+            if experiment_page_count == 0:
+                errors.append(f'{experiment.get("experimentNumber") or experiment.get("id")}: map at least one PDF page before submission.')
+            elif missing_core:
+                warnings.append(f'{experiment.get("experimentNumber") or experiment.get("id")}: missing core mappings for {", ".join(missing_core)}.')
         if not seen_pages:
             errors.append('At least one mapped PDF page is required.')
         return errors, warnings

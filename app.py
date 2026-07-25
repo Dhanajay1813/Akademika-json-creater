@@ -51,6 +51,16 @@ from image_optimizer import (
     summarize_records,
 )
 from product_catalog import clean_id, clean_product_id, get_categories, get_category_names, get_product_defaults, get_products, product_count
+from manual_library import (
+    DEFAULT_MANUAL_LIBRARY_PATH,
+    MOBILE_MANUAL_BLOCK_BYTES,
+    MOBILE_MANUAL_TARGET_BYTES,
+    MOBILE_MANUAL_WARNING_BYTES,
+    candidate_manuals,
+    estimated_library_size,
+    library_summary,
+    scan_manual_library,
+)
 
 st.set_page_config(page_title='Akademika Manual Content Builder', layout='wide')
 
@@ -76,6 +86,10 @@ def init_state():
         st.session_state.manual_pdf_optimized = None
     if 'manual_pdf_profile' not in st.session_state:
         st.session_state.manual_pdf_profile = PROFILE_HIGH_DETAIL
+    if 'manual_pdf_signature' not in st.session_state:
+        st.session_state.manual_pdf_signature = ''
+    if 'manual_source_mode' not in st.session_state:
+        st.session_state.manual_source_mode = 'Manual Library'
 
 
 def sync_manual_identity(defaults):
@@ -501,6 +515,119 @@ def sidebar():
 
 
 
+
+def compress_selected_pdf(source_bytes, source_name, source_signature, profile_key, manual):
+    if st.session_state.manual_pdf_signature == source_signature and st.session_state.manual_pdf_optimized:
+        optimized = st.session_state.manual_pdf_optimized
+        manual['_pdfBytes'] = optimized['bytes']
+        return optimized
+
+    validation = validate_pdf(source_bytes)
+    st.subheader('PDF Source')
+    col1, col2 = st.columns(2)
+    col1.write(f'**Filename:** `{source_name}`')
+    col1.write(f'**Original size:** `{pdf_human_size(len(source_bytes))}`')
+    col1.write(f'**Estimated compressed size:** `{pdf_human_size(estimate_compressed_size(source_bytes, profile_key))}`')
+    col2.write(f'**Total pages:** `{validation.page_count}`')
+    col2.write(f'**Encrypted:** `{validation.encrypted}`')
+    col2.write(f'**PDF validity:** `{"Valid" if validation.valid else "Invalid"}`')
+    if not validation.valid:
+        st.error(validation.error or 'PDF could not be validated.')
+        return None
+    try:
+        optimized = optimize_pdf(source_bytes, profile_key)
+    except Exception as exc:
+        st.error(f'Could not compress PDF: {exc}')
+        return None
+    st.session_state.manual_pdf_original = source_bytes
+    st.session_state.manual_pdf_optimized = optimized
+    st.session_state.manual_pdf_signature = source_signature
+    manual['originalFilename'] = source_name
+    manual['totalPages'] = optimized['pageCount']
+    manual['compressedByteSize'] = optimized['compressedSize']
+    manual['sha256'] = optimized['sha256']
+    manual['pdfFile'] = 'manual.pdf'
+    manual['_pdfBytes'] = optimized['bytes']
+    return optimized
+
+
+def render_library_size_dashboard(records, profile_key):
+    summary = library_summary(records)
+    estimated = estimated_library_size(records, profile_key)
+    st.subheader('Manual Library Size')
+    cols = st.columns(4)
+    cols[0].metric('PDF manuals found', summary['pdfCount'])
+    cols[1].metric('Current source total', pdf_human_size(summary['totalBytes']))
+    cols[2].metric('Estimated compressed total', pdf_human_size(estimated))
+    cols[3].metric('Target', pdf_human_size(MOBILE_MANUAL_TARGET_BYTES))
+    if estimated > MOBILE_MANUAL_BLOCK_BYTES:
+        st.error(f'Estimated bundled manual size is above {pdf_human_size(MOBILE_MANUAL_BLOCK_BYTES)}. Use stronger per-manual compression before app integration.')
+    elif estimated > MOBILE_MANUAL_WARNING_BYTES:
+        st.warning(f'Estimated bundled manual size is above {pdf_human_size(MOBILE_MANUAL_WARNING_BYTES)}. Review largest manuals before final app integration.')
+    elif estimated > MOBILE_MANUAL_TARGET_BYTES:
+        st.warning(f'Estimated bundled manual size is above the {pdf_human_size(MOBILE_MANUAL_TARGET_BYTES)} target but still below the hard guardrail.')
+    else:
+        st.success('Estimated bundled manual library is within the target size budget.')
+    if summary['largest']:
+        with st.expander('Largest source manuals'):
+            for record in summary['largest']:
+                st.write(f"{pdf_human_size(record['byteSize'])} - `{record['relativePath']}`")
+
+
+def selected_library_pdf(defaults, profile_key):
+    root_path = st.text_input('Manual library folder', value=DEFAULT_MANUAL_LIBRARY_PATH)
+    records = scan_manual_library(root_path)
+    if not records:
+        st.warning('No PDF manuals were found in the selected library folder.')
+        return None
+    render_library_size_dashboard(records, profile_key)
+    candidates = candidate_manuals(records, defaults)
+    options = candidates if candidates else records
+    if not candidates:
+        st.warning('No confident PDF match was found for this product. Select from all library PDFs.')
+    selected = st.selectbox(
+        'Product manual PDF',
+        options,
+        format_func=lambda record: f"{record['relativePath']} ({pdf_human_size(record['byteSize'])})",
+    )
+    return selected
+
+
+def experiment_page_count(experiment):
+    sections = experiment.get('sections', {})
+    total = 0
+    for key in SECTION_KEYS:
+        total += len(sections.get(key, {}).get('pages', []))
+    for key in TECHNICAL_DATA_KEYS:
+        total += len(sections.get('technicalData', {}).get(key, {}).get('pages', []))
+    return total
+
+
+def experiment_coverage_panel():
+    manual = st.session_state.manual
+    experiments = manual.setdefault('experiments', [])
+    st.subheader('Experiment Coverage')
+    target_count = st.number_input('Experiments in this manual', min_value=1, max_value=80, step=1, value=max(1, len(experiments) or 1))
+    if st.button('Create missing experiment rows'):
+        while len(experiments) < int(target_count):
+            experiments.append(make_experiment(len(experiments) + 1))
+        if st.session_state.selected_experiment_index >= len(experiments):
+            st.session_state.selected_experiment_index = max(0, len(experiments) - 1)
+        st.rerun()
+    rows = []
+    for experiment in experiments:
+        mapped = experiment_page_count(experiment)
+        missing_core = [SECTION_LABELS[key] for key in ('objective', 'theory', 'procedure') if not experiment.get('sections', {}).get(key, {}).get('pages')]
+        rows.append({
+            'Experiment': experiment.get('experimentNumber') or experiment.get('id'),
+            'Title': experiment.get('title') or 'Untitled',
+            'Mapped pages': mapped,
+            'Status': 'Mapped' if mapped else 'Needs pages',
+            'Core gaps': ', '.join(missing_core),
+        })
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
 def section_pages_editor(experiment, section_key, label, total_pages, technical=False):
     sections = experiment.setdefault('sections', make_empty_sections())
     container = sections.setdefault('technicalData', {}) if technical else sections
@@ -544,7 +671,6 @@ def preview_selected_pages(pdf_bytes, experiments):
 def manual_pdf_panel():
     manual = normalize_pdf_manual(st.session_state.manual)
     st.session_state.manual = manual
-    uploaded_pdf = st.file_uploader('Complete manual PDF upload', type=['pdf'])
     profile_keys = list(PDF_PROFILES.keys())
     profile_key = st.selectbox(
         'PDF compression profile',
@@ -555,61 +681,59 @@ def manual_pdf_panel():
     st.session_state.manual_pdf_profile = profile_key
     st.caption(PDF_PROFILES[profile_key]['description'])
 
-    if uploaded_pdf is None and not st.session_state.manual_pdf_optimized:
-        st.info('Upload one complete source PDF for this manual.')
+    source_mode = st.radio('Manual source', ['Manual Library', 'Upload PDF'], horizontal=True, key='manual_source_mode')
+    source_bytes = None
+    source_name = ''
+    source_signature = ''
+
+    if source_mode == 'Manual Library':
+        selected = selected_library_pdf(manual, profile_key)
+        if selected:
+            try:
+                with open(selected['path'], 'rb') as source:
+                    source_bytes = source.read()
+                source_name = selected['filename']
+                source_signature = f"library:{selected['relativePath']}:{selected['byteSize']}:{selected['mtime']}:{profile_key}"
+                st.caption(f"Selected library PDF: `{selected['relativePath']}`")
+            except OSError as exc:
+                st.error(f'Could not read selected library PDF: {exc}')
+                return False
+    else:
+        uploaded_pdf = st.file_uploader('Complete manual PDF upload', type=['pdf'])
+        if uploaded_pdf is not None:
+            source_bytes = uploaded_pdf.getvalue()
+            source_name = uploaded_pdf.name
+            source_signature = f"upload:{uploaded_pdf.name}:{getattr(uploaded_pdf, 'size', len(source_bytes))}:{profile_key}"
+
+    if source_bytes is None:
+        st.info('Select a product manual from the library or upload one complete source PDF.')
         return False
 
-    if uploaded_pdf is not None:
-        source_bytes = uploaded_pdf.getvalue()
-        validation = validate_pdf(source_bytes)
-        st.subheader('PDF Upload')
-        col1, col2 = st.columns(2)
-        col1.write(f'**Filename:** `{uploaded_pdf.name}`')
-        col1.write(f'**Original size:** `{pdf_human_size(len(source_bytes))}`')
-        col1.write(f'**Estimated compressed size:** `{pdf_human_size(estimate_compressed_size(source_bytes, profile_key))}`')
-        col2.write(f'**Total pages:** `{validation.page_count}`')
-        col2.write(f'**Encrypted:** `{validation.encrypted}`')
-        col2.write(f'**PDF validity:** `{"Valid" if validation.valid else "Invalid"}`')
-        if not validation.valid:
-            st.error(validation.error or 'PDF could not be validated.')
-            return False
-        try:
-            optimized = optimize_pdf(source_bytes, profile_key)
-        except Exception as exc:
-            st.error(f'Could not compress PDF: {exc}')
-            return False
-        st.session_state.manual_pdf_original = source_bytes
-        st.session_state.manual_pdf_optimized = optimized
-        manual['originalFilename'] = uploaded_pdf.name
-        manual['totalPages'] = optimized['pageCount']
-        manual['compressedByteSize'] = optimized['compressedSize']
-        manual['sha256'] = optimized['sha256']
-        manual['pdfFile'] = 'manual.pdf'
-        manual['_pdfBytes'] = optimized['bytes']
+    optimized = compress_selected_pdf(source_bytes, source_name, source_signature, profile_key, manual)
+    if not optimized:
+        return False
 
-    optimized = st.session_state.manual_pdf_optimized
-    if optimized:
-        manual['_pdfBytes'] = optimized['bytes']
-        st.subheader('Compression Summary')
-        cols = st.columns(3)
-        cols[0].metric('Original PDF size', pdf_human_size(optimized['originalSize']))
-        cols[1].metric('Compressed PDF size', pdf_human_size(optimized['compressedSize']))
-        cols[2].metric('Reduction', f"{pdf_human_size(optimized['bytesSaved'])} ({optimized['percentSaved']:.1f}%)")
-        st.write(f"**Profile:** `{optimized['profileLabel']}` | **Page count:** `{optimized['pageCount']}` | **SHA-256:** `{optimized['sha256']}`")
-        st.write(f"**Oversized raster images rewritten:** `{optimized['rewrittenImages']}`")
-        if optimized.get('warning'):
-            st.warning(optimized['warning'])
-        if optimized['compressedSize'] > 40 * 1024 * 1024:
-            st.warning('Compressed PDF remains unusually large for a bundled mobile asset.')
-        if optimized.get('blankPages'):
-            st.warning(f"Blank pages detected: {', '.join(str(page) for page in optimized['blankPages'])}")
-
-    return bool(st.session_state.manual_pdf_optimized)
+    manual['_pdfBytes'] = optimized['bytes']
+    st.subheader('Compression Summary')
+    cols = st.columns(3)
+    cols[0].metric('Original PDF size', pdf_human_size(optimized['originalSize']))
+    cols[1].metric('Compressed PDF size', pdf_human_size(optimized['compressedSize']))
+    cols[2].metric('Reduction', f"{pdf_human_size(optimized['bytesSaved'])} ({optimized['percentSaved']:.1f}%)")
+    st.write(f"**Profile:** `{optimized['profileLabel']}` | **Page count:** `{optimized['pageCount']}` | **SHA-256:** `{optimized['sha256']}`")
+    st.write(f"**Oversized raster images rewritten:** `{optimized['rewrittenImages']}`")
+    if optimized.get('warning'):
+        st.warning(optimized['warning'])
+    if optimized['compressedSize'] > 40 * 1024 * 1024:
+        st.warning('Compressed PDF remains unusually large for a bundled mobile asset.')
+    if optimized.get('blankPages'):
+        st.warning(f"Blank pages detected: {', '.join(str(page) for page in optimized['blankPages'])}")
+    return True
 
 
 def pdf_mapping_editor():
     manual = st.session_state.manual
     total_pages = int(manual.get('totalPages') or 0)
+    experiment_coverage_panel()
     if st.button('Add Experiment'):
         add_experiment()
         st.rerun()
