@@ -653,6 +653,34 @@ def experiment_coverage_panel():
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
+
+def render_page_preview_grid(pdf_bytes, pages, label, limit=12):
+    if not pdf_bytes or not pages:
+        return
+    st.caption(f'Previewing {label}: {", ".join(str(page) for page in pages)}')
+    if len(pages) > limit:
+        st.warning(f'Showing first {limit} mapped pages only. {len(pages) - limit} more page(s) are mapped.')
+    for row_start in range(0, min(len(pages), limit), 3):
+        columns = st.columns(3)
+        for column, page_number in zip(columns, pages[row_start:row_start + 3]):
+            with column:
+                try:
+                    st.image(render_page_thumbnail(pdf_bytes, page_number), caption=f'Manual page {page_number}', use_container_width=True)
+                except Exception as exc:
+                    st.warning(f'Could not render page {page_number}: {exc}')
+
+
+def mapped_section_rows(experiment):
+    sections = experiment.get('sections', {})
+    rows = []
+    for key in SECTION_KEYS:
+        pages = sections.get(key, {}).get('pages', [])
+        rows.append({'Section': SECTION_LABELS[key], 'Pages': ', '.join(str(page) for page in pages) or '-'})
+    for key in TECHNICAL_DATA_KEYS:
+        pages = sections.get('technicalData', {}).get(key, {}).get('pages', [])
+        rows.append({'Section': f'Technical Data - {TECHNICAL_DATA_LABELS[key]}', 'Pages': ', '.join(str(page) for page in pages) or '-'})
+    return rows
+
 def section_pages_editor(experiment, section_key, label, total_pages, technical=False):
     sections = experiment.setdefault('sections', make_empty_sections())
     container = sections.setdefault('technicalData', {}) if technical else sections
@@ -665,6 +693,8 @@ def section_pages_editor(experiment, section_key, label, total_pages, technical=
         current['pages'] = pages
         if pages:
             st.caption(f'Mapped pages: {", ".join(str(page) for page in pages)}')
+            if st.checkbox(f'Preview {label} mapped PDF pages', value=True, key=f'preview_{experiment["id"]}_{section_key}_{technical}'):
+                render_page_preview_grid(st.session_state.manual.get('_pdfBytes'), pages, label)
     except ValueError as exc:
         st.error(str(exc))
 
@@ -771,6 +801,8 @@ def pdf_mapping_editor():
     experiment['title'] = cols[2].text_input('Experiment Title', value=experiment.get('title', ''))
     experiment['displayOrder'] = cols[3].number_input('Display Order', min_value=1, step=1, value=int(experiment.get('displayOrder') or 1))
     st.caption('Use these tabs to index the selected manual PDF. The mobile app will show only the pages mapped here for each section.')
+    with st.expander('Selected experiment mapping review', expanded=True):
+        st.dataframe(mapped_section_rows(experiment), use_container_width=True, hide_index=True)
     tabs = st.tabs([SECTION_LABELS[key] for key in SECTION_KEYS] + ['Technical Data'])
     for tab, section_key in zip(tabs[:len(SECTION_KEYS)], SECTION_KEYS):
         with tab:
@@ -780,7 +812,8 @@ def pdf_mapping_editor():
         for tab, key in zip(tech_tabs, TECHNICAL_DATA_KEYS):
             with tab:
                 section_pages_editor(experiment, key, TECHNICAL_DATA_LABELS[key], total_pages, technical=True)
-    preview_selected_pages(manual.get('_pdfBytes'), manual.get('experiments', []))
+    with st.expander('Preview all mapped pages in this manual'):
+        preview_selected_pages(manual.get('_pdfBytes'), manual.get('experiments', []))
 
 def catalog_max_pdf_bytes():
     catalog = st.secrets.get('catalog', {})
