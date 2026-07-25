@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Dict, List
 
 
+REPO_MANUAL_LIBRARY_PATH = Path(__file__).resolve().parent / 'manual_library'
+LOCAL_MANUAL_LIBRARY_PATH = '/media/akademika4675/013B-BBD5/AKADEMIKA MAUAL_VER24.0'
 DEFAULT_MANUAL_LIBRARY_PATH = os.environ.get(
     'AKADEMIKA_MANUAL_LIBRARY',
-    '/media/akademika4675/013B-BBD5/AKADEMIKA MAUAL_VER24.0',
+    str(REPO_MANUAL_LIBRARY_PATH if REPO_MANUAL_LIBRARY_PATH.exists() else LOCAL_MANUAL_LIBRARY_PATH),
 )
 
 MOBILE_MANUAL_TARGET_BYTES = 850 * 1024 * 1024
