@@ -460,7 +460,7 @@ def validate_manual(manual: Dict, image_files: Dict[str, bytes]) -> Tuple[List[s
                     if total_pages and page > total_pages:
                         errors.append(f'{experiment.get("id")}.technicalData.{key} page {page} exceeds total pages {total_pages}.')
             if experiment_content_count == 0:
-                errors.append(f'{experiment.get("experimentNumber") or experiment.get("id")}: add at least one mapped PDF page or custom content block before submission.')
+                warnings.append(f'{experiment.get("experimentNumber") or experiment.get("id")}: no mapped PDF pages or custom content blocks are assigned.')
             elif missing_core:
                 warnings.append(f'{experiment.get("experimentNumber") or experiment.get("id")}: missing core content for {", ".join(missing_core)}.')
         if not seen_content:

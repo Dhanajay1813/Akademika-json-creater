@@ -321,6 +321,16 @@ def add_experiment():
     st.session_state.selected_experiment_index = len(experiments) - 1
 
 
+def delete_selected_experiment():
+    experiments = st.session_state.manual.setdefault('experiments', [])
+    if not experiments:
+        return None
+    index = min(st.session_state.selected_experiment_index, len(experiments) - 1)
+    removed = experiments.pop(index)
+    st.session_state.selected_experiment_index = min(index, max(0, len(experiments) - 1))
+    return removed
+
+
 def add_block_ui(experiment, section_key, blocks, technical=False):
     manual_id = st.session_state.manual.get('manualId', '')
     order = len(blocks) + 1
@@ -494,7 +504,15 @@ def sidebar():
     experiments = st.session_state.manual.get('experiments', [])
     if experiments:
         labels = [f"{exp.get('experimentNumber') or exp.get('id')} - {exp.get('title') or 'Untitled'}" for exp in experiments]
-        st.session_state.selected_experiment_index = st.sidebar.selectbox('Select Experiment', range(len(labels)), format_func=lambda i: labels[i], index=st.session_state.selected_experiment_index)
+        selected_index = min(st.session_state.selected_experiment_index, len(labels) - 1)
+        st.session_state.selected_experiment_index = st.sidebar.selectbox('Select Experiment', range(len(labels)), format_func=lambda i: labels[i], index=selected_index)
+        selected = experiments[st.session_state.selected_experiment_index]
+        delete_label = f"Delete {selected.get('experimentNumber') or selected.get('id') or 'selected experiment'}"
+        if st.sidebar.button(delete_label, type='secondary'):
+            removed = delete_selected_experiment()
+            if removed:
+                st.sidebar.success(f"Deleted {removed.get('experimentNumber') or removed.get('id') or 'experiment'}.")
+            st.rerun()
     else:
         st.sidebar.info('Add an experiment to start typing content.')
 
@@ -626,7 +644,7 @@ def experiment_coverage_panel():
     experiments = manual.setdefault('experiments', [])
     st.subheader('Experiment Setup')
     target_count = st.number_input('Experiments in this manual', min_value=1, max_value=80, step=1, value=max(1, len(experiments) or 1))
-    cols = st.columns(2)
+    cols = st.columns(3)
     if cols[0].button('Create / Open Experiment Rows'):
         while len(experiments) < int(target_count):
             experiments.append(make_experiment(len(experiments) + 1))
@@ -638,6 +656,9 @@ def experiment_coverage_panel():
     if cols[1].button('Add One More Experiment'):
         experiments.append(make_experiment(len(experiments) + 1))
         st.session_state.selected_experiment_index = len(experiments) - 1
+        st.rerun()
+    if experiments and cols[2].button('Delete Selected Experiment', type='secondary'):
+        delete_selected_experiment()
         st.rerun()
     if not experiments:
         experiments.append(make_experiment(1))
@@ -661,8 +682,8 @@ def experiment_coverage_panel():
             'Experiment': experiment.get('experimentNumber') or experiment.get('id'),
             'Title': experiment.get('title') or 'Untitled',
             'Section content': mapped,
-            'Status': 'Ready' if mapped else 'Needs content',
-            'Core gaps': ', '.join(missing_core),
+            'Status': 'Has content' if mapped else 'No content assigned',
+            'Empty optional core tabs': ', '.join(missing_core),
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
@@ -835,7 +856,7 @@ def pdf_mapping_editor():
     experiment['experimentNumber'] = cols[1].text_input('Experiment Number', value=experiment.get('experimentNumber', ''))
     experiment['title'] = cols[2].text_input('Experiment Title', value=experiment.get('title', ''))
     experiment['displayOrder'] = cols[3].number_input('Display Order', min_value=1, step=1, value=int(experiment.get('displayOrder') or 1))
-    st.caption('Use these tabs to choose section content. Each section can use mapped PDF pages, custom text/images/tables, or both.')
+    st.caption('Use only the sections this experiment needs. Observation, Result, Technical Data, and other tabs can be left empty when they do not apply.')
     with st.expander('Selected experiment mapping review', expanded=True):
         st.dataframe(mapped_section_rows(experiment), use_container_width=True, hide_index=True)
     tabs = st.tabs([SECTION_LABELS[key] for key in SECTION_KEYS] + ['Technical Data'])
